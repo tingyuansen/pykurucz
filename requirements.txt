@@ -1,0 +1,19 @@
+contourpy==1.3.3
+cycler==0.12.1
+fonttools==4.61.1
+kiwisolver==1.4.9
+llvmlite==0.46.0
+matplotlib==3.10.8
+numba==0.63.1
+numpy==2.3.5
+packaging==26.0
+pillow==12.1.1
+pyparsing==3.3.2
+python-dateutil==2.9.0.post0
+scipy==1.17.0
+six==1.17.0
+
+gdown>=5.1
+
+# Optional: needed only for the ATLAS12 emulator (pykurucz.py end-to-end mode)
+# torch

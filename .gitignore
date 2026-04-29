@@ -1,0 +1,39 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.nbc
+*.nbi
+
+# Virtual environments
+.venv/
+
+# OS artifacts
+.DS_Store
+
+# Output directories (regenerable)
+results/
+logs/
+synthe_py/out/
+lines/.py_line_cache/
+
+# Local-only scripts and tools (not for public repo)
+run_e2e_pipeline.py
+scripts/package_data_for_release.sh
+
+# DVC internals (no longer used — data is on HuggingFace Hub)
+.dvc/
+
+# data/ — large binary/executable files populated by scripts/setup_data.sh
+# Small text files (molecules.new, *.dat in lines/, spectrv_std.input) ARE tracked.
+data/lines/*.bin
+data/lines/*.partaa
+data/lines/*.partab
+data/lines/*.partac
+data/molecules/tio/*.bin
+data/molecules/h2o/*.bin
+data/molecules/*.dat
+data/molecules/*.asc
+data/bin_macos/
+data/bin_linux/
+data/synthe/linelists_full/tfort.*
+data/src/atlas12.for
