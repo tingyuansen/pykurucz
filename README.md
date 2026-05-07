@@ -75,6 +75,10 @@ python pykurucz.py --teff 4800 --logg 1.5 \
   CO, C₂, CH, OH, MgH, FeH, and ~50 molecular species in total. On by
   default when `data/molecules/` is populated.
 
+## Known limitation: extreme cool-RSG α-perturbed cells
+
+In a narrow corner — cool ($T_{\rm eff} \lesssim 4500$ K), low-gravity ($\log g = 0$) atmospheres with non-zero `--am` and small `--abund C:` perturbations — the kurucz-a1 emulator's prior is far enough from the true converged solution that ATLAS iterates into all-NaN before recovering. The defensive guards in this branch (Fixes 12 / 13 in `PYKURUCZ_FIXES.md`) catch the failure cleanly with a `RuntimeError` rather than silently writing a degenerate `.atm`. The escape hatch when this happens is a **neighbour warmstart** — pre-stage a converged neighbour cell's `.atm` as the initial guess for ATLAS, with the target's chemistry rewritten on top. See [`docs/user-guide/neighbour-warmstart.md`](docs/user-guide/neighbour-warmstart.md) for the recipe.
+
 ## Documentation
 
 Full documentation with installation guides, architecture deep-dives, physics reference, Python reference, and worked examples:
