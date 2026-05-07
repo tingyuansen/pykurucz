@@ -1,49 +1,67 @@
 # Neighbour-warmstart workflow (`--warmstart-atm`)
 
-!!! note "When you need this"
-    The kurucz-a1 emulator (the default `[1/3]` step) gives an atmospheric
-    starting guess that is good enough for the great majority of the
-    parameter space.  In a narrow corner — cool ($T_{\rm eff} \lesssim 4500$ K)
-    low-gravity ($\log g = 0$) atmospheres with non-zero α-element
-    perturbations and small $\Delta\mathrm{[C/H]}$ — the emulator's prior
-    is far enough from the true converged solution that ATLAS iterates
-    into all-NaN before recovering.  Symptom: the run fails with a
-    `RuntimeError: ATLAS atmosphere degenerate ...` (the Fix 13 guard) or
-    `ATLAS atmosphere went all-NaN at iteration N for K consecutive
-    iterations` (Fix 14).  See [`PYKURUCZ_FIXES.md`][fixes] Issue 15 for
-    the full diagnosis.
+!!! note "What this is"
+    A bridge between the two main workflows:
+    [from stellar parameters](from-parameters.md) (which uses the
+    kurucz-a1 emulator to seed ATLAS) and
+    [from an existing atmosphere](from-atmosphere.md) (which skips
+    ATLAS entirely and treats the supplied `.atm` as fixed).
+
+    With `--warmstart-atm` you supply a pre-computed `.atm` file as
+    pykurucz's *initial guess* for the target's chemistry, then let
+    ATLAS iterate it to convergence against the requested `--mh`,
+    `--am`, and `--abund` arguments.  The atmosphere is **not** frozen
+    (unlike pure from-atmosphere mode), and the emulator is **not**
+    consulted (unlike pure from-parameters mode).
+
+## When you need this
+
+The kurucz-a1 emulator covers the great majority of the parameter
+space, but like any neural emulator its accuracy degrades near the
+edges of its training distribution.  In those regions the prior can be
+far enough from the true converged solution that ATLAS iterates into
+all-NaN before recovering.
+
+This is a **known coverage limitation** of the trained emulator, not a
+bug in the solver.  The intended long-term fix is to broaden the
+emulator's training distribution so the failing region is covered
+natively; in the meantime, supplying a converged neighbour cell as the
+warmstart bypasses the bad prior and lets you proceed.
+
+The defensive guards on the ATLAS side detect the failure cleanly
+(rather than silently writing a degenerate atmosphere), so you get a
+clear error rather than a corrupt result.  Typical symptoms that mean
+"try `--warmstart-atm`":
+
+- ATLAS aborts with a NaN-streak or degenerate-atmosphere error on a
+  from-parameters run.
+- The emulator emits an out-of-range warning, e.g.
+  `[alpha/M]=-0.30 outside training range [-0.2, +0.6]`.
+
+It is also a useful speedup if you already have a converged neighbour
+on disk — convergence typically takes 5–10 ATLAS iterations rather
+than 25–30.
 
 ## What the flag does
 
 `pykurucz.py --warmstart-atm /path/to/donor.atm` skips the kurucz-a1
-emulator step entirely.  Instead it takes the supplied `.atm` file's
-**layer structure** ($T(\tau)$, $P(\tau)$, $\rho_x(\tau)$, $X_{\rm Ne}(\tau)$,
+emulator step entirely.  It takes the supplied `.atm` file's **layer
+structure** ($T(\tau)$, $P(\tau)$, $\rho_x(\tau)$, $X_{\rm Ne}(\tau)$,
 $\kappa_{\rm Ross}(\tau)$, $a_{\rm rad}(\tau)$, $v_{\rm turb}$,
 $F_{\rm cnv}$, $v_{\rm cnv}$ per layer) and rewrites the header
 ($T_{\rm eff}$, $\log g$, the full ABUNDANCE block) using the target's
 `--teff / --logg / --mh / --am / --abund` arguments.
 
-This means atlas_py iterates from a near-converged starting state for
-the *target* cell, even though the donor was a different cell.  It
-typically converges in 5–10 ATLAS iterations rather than 25–30.
-
-## When to use it
-
-- After getting the `Fix 13`/`Fix 14` failure modes from a from-emulator
-  run.
-- When the emulator's `[alpha/M]` warning shows the requested cell is
-  outside the training range: `[alpha/M]=-0.30 outside training range
-  [-0.2, +0.6]`.
-- When you want fast turnaround on a cell whose neighbour you've
-  already converged.
+ATLAS then iterates this rewritten state to convergence for the
+*target* cell.
 
 ## Picking a donor
 
 The donor `.atm` should be a converged cell at the closest available
-$(T_{\rm eff}, \Delta\mathrm{[C/H]}, \Delta\mathrm{[N/H]}, [\alpha/{\rm Fe}])$
-to your target.  Same galaxy/host metallicity is preferred but not
-strictly required — the donor's layer structure is just an initial
-guess; ATLAS will re-converge against the target's chemistry.
+$(T_{\rm eff}, \log g, [\mathrm{M/H}], [\alpha/\mathrm{M}],$ any other
+abundance dimensions you vary$)$ to your target.  The donor's layer
+structure is just an initial guess; ATLAS re-converges against the
+target's chemistry, so an exact chemistry match is not required.
 
 A simple L2-distance picker (treating $T_{\rm eff}$/100 as units that
 balance the dex-scaled chemistry axes) works well in practice.
@@ -55,7 +73,7 @@ pykurucz.py \
     --teff 4300 --logg 0.0 --mh -0.5 --am -0.3 --vturb 2.0 \
     --abund C:-1.10 --abund N:-0.20 \
     --wl-start 600 --wl-end 900 --resolution 50000 \
-    --warmstart-atm /path/to/LMC_t4300_dCm050_dNp030/atm/t04300g0.00_mh-0.50_am-0.30.atm \
+    --warmstart-atm /path/to/donor_grid/t04300g0.00_mh-0.50_am-0.30.atm \
     --output-dir /path/to/output
 ```
 
@@ -78,8 +96,6 @@ normally.
 - The donor's `.atm` must be a real converged file (not a
   `*_warmstart.atm`).  pykurucz parses the `READ DECK6` block, so any
   Kurucz-format atmosphere with that structure works.
-- This is a workflow escape hatch, not a numerical fix to the emulator
-  or to ATLAS.  The right long-term solution is to broaden the
-  emulator's training distribution (Issue 15).
-
-[fixes]: https://github.com/...your-fork.../PYKURUCZ_FIXES.md
+- This is a workflow escape hatch, not a numerical fix.  The proper
+  long-term solution is to broaden the emulator's training
+  distribution so the failing region is covered natively.
