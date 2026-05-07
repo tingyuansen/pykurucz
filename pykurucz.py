@@ -585,6 +585,7 @@ def synthesize(
     atlas_convergence_min_iterations: int = 5,
     atlas_convergence_consecutive: int = 1,
     n_workers: Optional[int] = None,
+    warmstart_atm_override: Optional[str] = None,
 ) -> Path:
     """Generate a synthetic spectrum from stellar parameters.
 
@@ -674,30 +675,65 @@ def synthesize(
     synthe_log = log_dir / f"{stem}_synthe_{int(wl_start)}_{int(wl_end)}.log"
 
     # ── Stage 1: Emulator warm-start ────────────────────────────────────
-    print("[1/3] Predicting warm-start atmosphere with kurucz-a1 emulator...")
-    print(f"      Teff={teff:.0f} K, logg={logg:.2f}, vturb={vturb:.1f} km/s")
-    if abundances:
-        overrides = ", ".join(
-            f'[{ELEM_SYM.get(z, f"Z={z}")}/H]={v:+.2f}'
-            for z, v in sorted(abundances.items())
-        )
-        print(f"      Individual abundances: {overrides}")
-        if eff_mh != mh or eff_am != am:
-            print(f"      Derived emulator params: [M/H]={eff_mh:+.2f}, [alpha/M]={eff_am:+.2f}")
+    if warmstart_atm_override is not None:
+        # Take the donor's READ DECK6 layer block (T, P, RHOX, XNE, ABROSS,
+        # ACCRAD, VTURB, FLXCNV, VCONV) and rewrite the header so TEFF /
+        # GRAVITY and the ABUNDANCE block reflect the *target* cell —
+        # atlas_py reads chemistry from the .atm file only, so a verbatim
+        # copy of the donor would give the wrong abundances.
+        src_atm = Path(warmstart_atm_override).expanduser().resolve()
+        if not src_atm.is_file():
+            print(f"ERROR: --warmstart-atm path does not exist: {src_atm}")
+            sys.exit(1)
+        print(f"[1/3] Using neighbour donor .atm for layer structure, target chemistry: {src_atm}")
+        donor_text = src_atm.read_text().splitlines()
+        for i_deck, ln in enumerate(donor_text):
+            if ln.lstrip().startswith("READ DECK6"):
+                break
         else:
-            print(f"      Emulator params: [M/H]={eff_mh:+.2f}, [alpha/M]={eff_am:+.2f}")
-    else:
-        print(f"      [M/H]={mh:+.2f}, [alpha/M]={am:+.2f}")
-
-    try:
-        emulator_warmstart_atm(
+            print(f"ERROR: donor .atm has no READ DECK6 line: {src_atm}")
+            sys.exit(1)
+        layer_lines = []
+        for ln in donor_text[i_deck + 1:]:
+            stripped = ln.strip()
+            if not stripped or stripped.startswith(("PRADK", "BEGIN")):
+                break
+            layer_lines.append(stripped)
+        data = np.array([[float(x) for x in ln.split()] for ln in layer_lines])
+        if data.shape[1] < 9:
+            pad = np.zeros((data.shape[0], 9 - data.shape[1]))
+            data = np.concatenate([data, pad], axis=1)
+        write_atm_file(
             warmstart_atm,
             teff=teff, logg=logg, mh=mh, am=am, vturb=vturb,
-            abundances=abundances,
+            individual=abundances,
+            data=data,
         )
-    except RuntimeError as exc:
-        print(f"ERROR in emulator: {exc}")
-        sys.exit(1)
+    else:
+        print("[1/3] Predicting warm-start atmosphere with kurucz-a1 emulator...")
+        print(f"      Teff={teff:.0f} K, logg={logg:.2f}, vturb={vturb:.1f} km/s")
+        if abundances:
+            overrides = ", ".join(
+                f'[{ELEM_SYM.get(z, f"Z={z}")}/H]={v:+.2f}'
+                for z, v in sorted(abundances.items())
+            )
+            print(f"      Individual abundances: {overrides}")
+            if eff_mh != mh or eff_am != am:
+                print(f"      Derived emulator params: [M/H]={eff_mh:+.2f}, [alpha/M]={eff_am:+.2f}")
+            else:
+                print(f"      Emulator params: [M/H]={eff_mh:+.2f}, [alpha/M]={eff_am:+.2f}")
+        else:
+            print(f"      [M/H]={mh:+.2f}, [alpha/M]={am:+.2f}")
+
+        try:
+            emulator_warmstart_atm(
+                warmstart_atm,
+                teff=teff, logg=logg, mh=mh, am=am, vturb=vturb,
+                abundances=abundances,
+            )
+        except RuntimeError as exc:
+            print(f"ERROR in emulator: {exc}")
+            sys.exit(1)
     print(f"      Warm-start: {warmstart_atm}")
 
     # ── Stage 2: atlas_py iteration ─────────────────────────────────────
@@ -858,6 +894,15 @@ Notes:
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Output directory (default: results/)")
     parser.add_argument(
+        "--warmstart-atm", type=str, default=None,
+        help="Path to a pre-staged warm-start .atm file. When set, skip "
+             "the kurucz-a1 emulator and use this file's layer structure "
+             "as ATLAS's initial guess (with the target's chemistry "
+             "rewritten on top). Use this when the emulator's prior is "
+             "outside its training distribution and ATLAS NaN-explodes "
+             "from the from-parameters path.",
+    )
+    parser.add_argument(
         "--no-molecular-lines",
         action="store_true",
         default=False,
@@ -911,6 +956,7 @@ Notes:
         use_molecular_lines=not args.no_molecular_lines,
         include_tio=not args.no_tio,
         include_h2o=not args.no_h2o,
+        warmstart_atm_override=args.warmstart_atm,
     )
 
 
