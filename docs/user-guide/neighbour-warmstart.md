@@ -63,8 +63,9 @@ abundance dimensions you vary$)$ to your target.  The donor's layer
 structure is just an initial guess; ATLAS re-converges against the
 target's chemistry, so an exact chemistry match is not required.
 
-A simple L2-distance picker (treating $T_{\rm eff}$/100 as units that
-balance the dex-scaled chemistry axes) works well in practice.
+In practice, picking the closest cell by hand or with a simple
+nearest-neighbour search over your grid (treating $T_{\rm eff}$/100 as
+units that balance the dex-scaled chemistry axes) works well.
 
 ## Example
 
