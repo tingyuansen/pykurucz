@@ -1342,6 +1342,13 @@ class HydrogenProfileEvaluator:
 def equil_h2(temperature_k: np.ndarray | float, *, tables: HydrogenProfileTables | None = None) -> np.ndarray:
     tbl = load_hydrogen_profile_tables_from_atlas12() if tables is None else tables
     t = np.asarray(temperature_k, dtype=np.float64)
+    # Defensive guard (Fix 8a, 2026-05-03): NaN/inf in t silently casts to
+    # garbage int64 values which then propagate downstream and trigger
+    # ValueError in scalar callers (nmolec._interp_h2_pf). Replace
+    # non-finite or out-of-table temperatures with safe in-range floors
+    # before the floor->int cast.
+    t = np.where(np.isfinite(t) & (t > 100.0), t, 100.0)
+    t = np.minimum(t, 19900.0)
     n = np.floor(t / 100.0).astype(np.int64)
     n = np.minimum(199, np.maximum(1, n))
     pf = tbl.pf_h2

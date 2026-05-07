@@ -109,8 +109,14 @@ def _deriv(x: np.ndarray, f: np.ndarray) -> np.ndarray:
     dfdx = np.zeros(n, dtype=np.float64)
     if n < 2:
         return dfdx
-    dfdx[0] = (f[1] - f[0]) / (x[1] - x[0])
-    dfdx[-1] = (f[-1] - f[-2]) / (x[-1] - x[-2])
+    # Guard the boundary divisions: if a τ grid happens to have a duplicate
+    # entry (which can occur in extreme RSG atmospheres where the optical-
+    # depth integration produces near-coincident points), fall back to zero
+    # rather than raising ZeroDivisionError.
+    dx0 = x[1] - x[0]
+    dxN = x[-1] - x[-2]
+    dfdx[0]  = (f[1] - f[0]) / dx0 if dx0 != 0.0 else 0.0
+    dfdx[-1] = (f[-1] - f[-2]) / dxN if dxN != 0.0 else 0.0
     if n == 2:
         return dfdx
 
@@ -120,11 +126,32 @@ def _deriv(x: np.ndarray, f: np.ndarray) -> np.ndarray:
         scale = scale / abs(x[j]) if x[j] != 0.0 else scale
         if scale == 0.0:
             scale = 1.0
-        d1 = (f[j + 1] - f[j]) / (x[j + 1] - x[j]) / scale
-        d0 = (f[j] - f[j - 1]) / (x[j] - x[j - 1]) / scale
-        tan1 = d1 / (s * np.sqrt(1.0 + d1 * d1) + 1.0)
-        tan0 = d0 / (s * np.sqrt(1.0 + d0 * d0) + 1.0)
-        dfdx[j] = (tan1 + tan0) / (1.0 - tan1 * tan0) * scale
+        # Same guard for interior divisions: skip the cubic-tangent update
+        # if either spacing collapses (rare; usually corner cases at the
+        # top of the atmosphere when Tcorr drove dRHOX → 0).
+        dxp = x[j + 1] - x[j]
+        dxm = x[j] - x[j - 1]
+        if dxp == 0.0 or dxm == 0.0:
+            dfdx[j] = 0.0
+            continue
+        d1 = (f[j + 1] - f[j]) / dxp / scale
+        d0 = (f[j] - f[j - 1]) / dxm / scale
+        # Fix 11: when s=-1 and d1=0 (consecutive equal f-values on a descending
+        # x-grid), the denominator collapses to zero -> ZeroDivisionError.
+        denom1 = s * np.sqrt(1.0 + d1 * d1) + 1.0
+        denom0 = s * np.sqrt(1.0 + d0 * d0) + 1.0
+        if abs(denom1) < 1e-30 or abs(denom0) < 1e-30:
+            dfdx[j] = 0.5 * (d0 + d1) * scale
+            continue
+        tan1 = d1 / denom1
+        tan0 = d0 / denom0
+        denom = 1.0 - tan1 * tan0
+        # Final safety: tan1*tan0 ≈ 1 produces a singular slope.  Cap with
+        # a finite-difference fallback.
+        if abs(denom) < 1e-30:
+            dfdx[j] = 0.5 * (d0 + d1) * scale
+        else:
+            dfdx[j] = (tan1 + tan0) / denom * scale
     return dfdx
 
 
@@ -170,20 +197,26 @@ def _map1_kernel(
                 if l == 2 or l == 3:
                     l = min(nold, l)
                     c = 0.0
-                    b = (fold1[l] - fold1[l - 1]) / (xold1[l] - xold1[l - 1])
+                    # Guard duplicate-x: degenerate τ grids in extreme RSG
+                    # atmospheres can produce coincident sample points,
+                    # which would raise ZeroDivisionError inside the JIT.
+                    dx_b = xold1[l] - xold1[l - 1]
+                    b = (fold1[l] - fold1[l - 1]) / dx_b if dx_b != 0.0 else 0.0
                     a = fold1[l] - xold1[l] * b
                     ll = l
                     break
                 l1 = l - 1
                 if l > ll + 1 or l == 3 or l == 4:
                     # Fortran label 21: compute backward quadratic from L-2,L-1,L
-                    d = (fold1[l1] - fold1[l - 2]) / (xold1[l1] - xold1[l - 2])
-                    cbac = (
-                        fold1[l]
-                        / ((xold1[l] - xold1[l1]) * (xold1[l] - xold1[l - 2]))
-                        + (fold1[l - 2] / (xold1[l] - xold1[l - 2]) - fold1[l1] / (xold1[l] - xold1[l1]))
-                        / (xold1[l1] - xold1[l - 2])
-                    )
+                    dx_d   = xold1[l1] - xold1[l - 2]
+                    dx_l1  = xold1[l]  - xold1[l1]
+                    dx_l2  = xold1[l]  - xold1[l - 2]
+                    d = (fold1[l1] - fold1[l - 2]) / dx_d if dx_d != 0.0 else 0.0
+                    cbac1 = fold1[l] / (dx_l1 * dx_l2) if dx_l1 != 0.0 and dx_l2 != 0.0 else 0.0
+                    cbac2_a = fold1[l - 2] / dx_l2 if dx_l2 != 0.0 else 0.0
+                    cbac2_b = fold1[l1]    / dx_l1 if dx_l1 != 0.0 else 0.0
+                    cbac2 = (cbac2_a - cbac2_b) / dx_d if dx_d != 0.0 else 0.0
+                    cbac = cbac1 + cbac2
                     bbac = d - (xold1[l1] + xold1[l - 2]) * cbac
                     abac = fold1[l - 2] - xold1[l - 2] * d + xold1[l1] * xold1[l - 2] * cbac
                 else:
@@ -199,12 +232,15 @@ def _map1_kernel(
                     ll = l
                     break
                 # Fortran label 25: compute forward quadratic from L-1,L,L+1
-                d = (fold1[l] - fold1[l1]) / (xold1[l] - xold1[l1])
-                cfor = (
-                    fold1[l + 1] / ((xold1[l + 1] - xold1[l]) * (xold1[l + 1] - xold1[l1]))
-                    + (fold1[l1] / (xold1[l + 1] - xold1[l1]) - fold1[l] / (xold1[l + 1] - xold1[l]))
-                    / (xold1[l] - xold1[l1])
-                )
+                dx_dF  = xold1[l]     - xold1[l1]
+                dx_p1  = xold1[l + 1] - xold1[l]
+                dx_p2  = xold1[l + 1] - xold1[l1]
+                d = (fold1[l] - fold1[l1]) / dx_dF if dx_dF != 0.0 else 0.0
+                cfor1 = fold1[l + 1] / (dx_p1 * dx_p2) if dx_p1 != 0.0 and dx_p2 != 0.0 else 0.0
+                cfor2_a = fold1[l1] / dx_p2 if dx_p2 != 0.0 else 0.0
+                cfor2_b = fold1[l]  / dx_p1 if dx_p1 != 0.0 else 0.0
+                cfor2 = (cfor2_a - cfor2_b) / dx_dF if dx_dF != 0.0 else 0.0
+                cfor = cfor1 + cfor2
                 bfor = d - (xold1[l] + xold1[l1]) * cfor
                 afor = fold1[l1] - xold1[l1] * d + xold1[l] * xold1[l1] * cfor
                 wt = 0.0
@@ -220,7 +256,9 @@ def _map1_kernel(
             if l > nold:
                 l = min(nold, l)
                 c = 0.0
-                b = (fold1[l] - fold1[l - 1]) / (xold1[l] - xold1[l - 1])
+                # Same duplicate-x guard as above.
+                dx_b = xold1[l] - xold1[l - 1]
+                b = (fold1[l] - fold1[l - 1]) / dx_b if dx_b != 0.0 else 0.0
                 a = fold1[l] - xold1[l] * b
                 ll = l
                 break

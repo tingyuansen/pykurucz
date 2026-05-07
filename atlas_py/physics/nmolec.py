@@ -118,6 +118,14 @@ def get_nmolec_snapshot() -> dict[str, np.ndarray] | None:
 
 
 def _interp_h2_pf(t: float) -> float:
+    # Defensive guard: t can be NaN/inf when propagated from upstream
+    # opacity NaNs in hot-RSG runs (Fix 8a, 2026-05-03). int(NaN) raises
+    # ValueError inside numba/finite-difference paths and crashes the
+    # whole atmosphere iteration. Clamp to a safe in-range temperature.
+    if not np.isfinite(t) or t <= 100.0:
+        t = 100.0
+    elif t >= 19900.0:
+        t = 19900.0
     n = int(t / 100.0)
     n = min(199, max(1, n))
     p0 = _H2_PF[n - 1]
@@ -126,8 +134,13 @@ def _interp_h2_pf(t: float) -> float:
 
 
 def _equilh2(t: float) -> float:
+    # Defensive guard: if T is non-finite or negative the (...)^1.5 below
+    # produces complex which then fails the `>` comparison in `max(.., 1e-300)`.
+    # Fall back to a sensible floor temperature.
+    if not np.isfinite(t) or t <= 0.0:
+        t = 1.0
     pf = _interp_h2_pf(t)
-    denom = (
+    denom_arg = (
         2.0
         * np.pi
         * 1.008
@@ -135,9 +148,13 @@ def _equilh2(t: float) -> float:
         * _K_BOLTZ
         / (_H_PLANCK**2)
         * t
-    ) ** 1.5
+    )
+    if not np.isfinite(denom_arg) or denom_arg <= 0.0:
+        denom_arg = 1e-300
+    denom = denom_arg ** 1.5
     expo = 36118.11 * _H_PLANCK * _C_LIGHT / _K_BOLTZ / max(t, 1e-30)
-    return float(pf * (2.0**1.5) / 4.0 / max(denom, 1e-300) * np.exp(expo))
+    val = pf * (2.0**1.5) / 4.0 / max(denom, 1e-300) * np.exp(expo)
+    return float(val) if np.isfinite(val) else 0.0
 
 
 def _pfsaha_single(*, j: int, id_atomic: int, nion: int, mode: int, temp_override: float | None = None) -> np.ndarray:

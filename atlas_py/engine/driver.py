@@ -499,6 +499,11 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
     convergence_min_iterations = max(1, int(cfg.convergence_min_iterations))
     convergence_consecutive_required = max(1, int(cfg.convergence_consecutive))
     convergence_consecutive_count = 0
+    # Fix 14: tracks consecutive iterations where convergence metrics are
+    # all non-finite (an unambiguous NaN-explosion).  After 3 such
+    # iterations we bail with RuntimeError to avoid grinding through
+    # all 30 iterations only to fail at write time (Fix 13).
+    convergence_nan_streak = 0
     completed_iterations = 0
 
     gravity_cgs = _gravity_from_atm_metadata(atm)
@@ -1284,14 +1289,44 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
                 )
                 for name, value in convergence_after.items()
             }
-            physical_convergence_max = max(
+            # Fix 8c (2026-05-03): an iteration that produces NO finite
+            # convergence metrics is the opposite of converged — it means
+            # the atmosphere has gone NaN.  Returning 0.0 here causes the
+            # `physical_max < epsilon` check below to spuriously trigger
+            # an "early convergence" stop on a fully broken atmosphere.
+            # Use +inf instead so the convergence check definitively
+            # fails and the iteration loop continues (giving the
+            # self-healing TCORR / PFSAHA guards a chance to recover).
+            _physical_finite = [
                 convergence_metrics[name]
                 for name in ("RHOX", "T", "P", "XNE", "ABROSS", "VTURB")
                 if np.isfinite(convergence_metrics[name])
+            ]
+            physical_convergence_max = (
+                max(_physical_finite) if _physical_finite else float("inf")
             )
-            convergence_max = max(
-                value for value in convergence_metrics.values() if np.isfinite(value)
-            )
+            _all_finite = [
+                value for value in convergence_metrics.values()
+                if np.isfinite(value)
+            ]
+            convergence_max = max(_all_finite) if _all_finite else float("inf")
+            # Fix 14: detect a sustained all-NaN convergence-metric state.
+            # A single bad iteration can self-heal (TCORR / PFSAHA / Fix 12
+            # all give the next iteration a chance to recover).  Three in
+            # a row is unambiguously a divergent atmosphere — bail rather
+            # than burn the remaining ~25 iterations on NaN.
+            if not _all_finite:
+                convergence_nan_streak += 1
+                if convergence_nan_streak >= 3:
+                    raise RuntimeError(
+                        f"ATLAS atmosphere went all-NaN at iteration {iter_no}/"
+                        f"{numits} for {convergence_nan_streak} consecutive "
+                        f"iterations; convergence_metrics are non-finite. "
+                        f"Aborting (Fix 14) instead of grinding through to "
+                        f"iteration {numits}."
+                    )
+            else:
+                convergence_nan_streak = 0
             logger.info(
                 "Convergence iteration %d/%d: physical_max=%.3e max_col=%.3e %s",
                 iter_no,
@@ -1358,6 +1393,20 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
         abundances=atm.abundances.copy(),
     )
     logger.info("Timing: post-loop (ROSS/CONVEC/TCORR/output) in %.3fs", time.perf_counter() - _t_stage)
+    # Fix 13: refuse to write a degenerate atmosphere.  ATLAS sometimes runs
+    # all numits iterations after T(tau) has gone NaN (Issue 8c).  Without
+    # this guard, the silent NaN .atm reaches SYNTHE which then refuses it
+    # with the misleading 'XNE not found' error, after wasting another 30+
+    # min on linelist conversion.  Better to fail fast in ATLAS itself.
+    nan_T = ~np.isfinite(out.temperature)
+    nan_X = ~np.isfinite(out.electron_density)
+    if nan_T.any() or nan_X.any():
+        raise RuntimeError(
+            f"ATLAS atmosphere degenerate at iteration {completed_iterations}: "
+            f"NaN/inf in {int(nan_T.sum())}/{out.temperature.size} T layers, "
+            f"{int(nan_X.sum())}/{out.electron_density.size} XNE layers; "
+            f"refusing to write {cfg.outputs.output_atm_path}"
+        )
     write_atm(out, cfg.outputs.output_atm_path)
     if cfg.outputs.debug_state_path is not None:
         _write_debug_state_npz(

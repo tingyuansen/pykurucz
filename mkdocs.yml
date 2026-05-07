@@ -105,6 +105,7 @@ nav:
       - Atmosphere Emulator: user-guide/emulator.md
       - Output Files: user-guide/output-files.md
       - CLI Reference: user-guide/cli-reference.md
+      - Neighbour Warmstart (rescue): user-guide/neighbour-warmstart.md
   - Architecture:
       - Overview: architecture/overview.md
       - atlas_py: architecture/atlas-py.md

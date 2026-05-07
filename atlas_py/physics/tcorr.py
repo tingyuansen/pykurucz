@@ -746,6 +746,15 @@ def tcorr_step(
 
     dtsurf = np.full(n, dtsur, dtype=np.float64)
     hratio = cnvflx / np.maximum(cnvflx + st.flxrad, 1e-300)
+    # Fix B: sanitize correction components per layer.  A NaN/inf in any of
+    # dtflux/dtlamb/dtsurf would propagate through `t1` to `tnew`, then through
+    # the monotonicity clamp (line ~779) into shallower layers, ultimately
+    # reaching PFSAHA with a NaN temperature.  Replacing non-finite entries
+    # with zero means "no correction at this layer this iteration", which is
+    # the safe default and lets convergence proceed.
+    dtflux = np.nan_to_num(dtflux, nan=0.0, posinf=0.0, neginf=0.0)
+    dtlamb = np.nan_to_num(dtlamb, nan=0.0, posinf=0.0, neginf=0.0)
+    dtsurf = np.nan_to_num(dtsurf, nan=0.0, posinf=0.0, neginf=0.0)
     t1 = dtflux + dtlamb + dtsurf
 
     for j in range(n):
@@ -764,6 +773,13 @@ def tcorr_step(
         st.oldt1[j] = t1[j]
 
     tnew = t + t1
+    # Fix A: replace non-finite layers with the previous-iteration value, and
+    # clamp to a positive minimum.  This stops a single bad layer from poisoning
+    # the rest of the column (especially via the monotonicity clamp below).
+    bad = ~np.isfinite(tnew)
+    if bad.any():
+        tnew = np.where(bad, t, tnew)
+    tnew = np.maximum(tnew, 1.0)
     if j1smooth > 0:
         jlo = max(j1smooth - 1, 1)
         jhi = min(j2smooth - 1, n - 2)
@@ -774,9 +790,14 @@ def tcorr_step(
             for j in range(jlo, jhi + 1):
                 tnew[j] = tsmooth[j]
 
+    # NaN-safe monotonicity clamp: deep-to-shallow so each layer is at least
+    # 1 K below its deeper neighbour.  Use np.fmin so a stray NaN does not
+    # propagate upward into shallower layers.
     for i in range(1, n):
         j = n - 1 - i
-        tnew[j] = min(tnew[j], tnew[j + 1] - 1.0)
+        tnew[j] = np.fmin(tnew[j], tnew[j + 1] - 1.0)
+        if not np.isfinite(tnew[j]):
+            tnew[j] = max(t[j], 1.0)
 
     if prad is None:
         prad = np.zeros(n, dtype=np.float64)

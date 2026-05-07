@@ -195,7 +195,13 @@ def _build_h_tables() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def _fastex(x: float, extab: np.ndarray, extabf: np.ndarray) -> float:
-    if x < 0.0 or x >= 1001.0:
+    # Guard NaN/inf: a non-finite x can arrive here when an upstream
+    # divergence (TCORR overshoot, hydrostatic floor) leaves stray
+    # non-finite values in the column.  Returning 0 is the safe choice
+    # (no contribution from this layer/line for this iteration); the
+    # convergence monitor in driver.py will catch a genuinely runaway
+    # column on the next pass.
+    if not np.isfinite(x) or x < 0.0 or x >= 1001.0:
         return 0.0
     i = int(x)
     j = int((x - float(i)) * 1000.0 + 1.5)
@@ -355,7 +361,11 @@ if _NUMBA_AVAILABLE:
 
     @_njit
     def _fastex_nb(x, extab, extabf):
-        if x < 0.0 or x >= 1001.0:
+        # Guard NaN/inf: numba's int(NaN) raises ValueError inside the JIT,
+        # so explicitly bail out for non-finite x.  Returning 0 corresponds
+        # to "no opacity contribution from this layer this iteration",
+        # which lets the iteration recover.
+        if not (x == x) or x < 0.0 or x >= 1001.0:
             return 0.0
         i = int(x)
         j = int((x - float(i)) * 1000.0 + 1.5)
@@ -1188,13 +1198,29 @@ def linop1(
     iwavetab = np.asarray(i_wavetab, dtype=np.int64)
     # Fortran LINOP1 uses IMPLICIT REAL*4: TABCONT, XNFDOP, DOPPLE, HCKT4,
     # XNE4 are all REAL*4.  Keep WAVESET as float64 (Fortran REAL*8).
-    tab = np.asarray(tabcont, dtype=np.float32)
+    # Fix 8d (2026-05-03): clip non-finite or extreme values that overflow
+    # the float32 cast.  Real stellar XNE never exceeds ~1e20 cm^-3, so a
+    # ceiling of 1e30 is far above any physical value while comfortably
+    # below the float32 max (~3.4e38).  Without this clip, a single
+    # diverging atmosphere iteration produces inf/NaN in the cast and
+    # propagates through the entire LINOP/RT chain, poisoning the
+    # next iteration's atmosphere and producing the silent-NaN
+    # convergence failure documented in PYKURUCZ_FIXES.md Fix 8a.
+    def _safe_f32(arr, ceiling: float = 1e30):
+        a = np.asarray(arr, dtype=np.float64)
+        a = np.where(np.isfinite(a), a, 0.0)
+        a = np.clip(a, -ceiling, ceiling)
+        return a.astype(np.float32)
+
+    tab = _safe_f32(tabcont)
     t = np.asarray(temperature_k, dtype=np.float64)
-    hckt_arr = np.asarray(hckt, dtype=np.float32)
-    xne_arr = np.asarray(xne, dtype=np.float32)
+    t = np.where(np.isfinite(t) & (t > 0.0), t, 1.0)
+    hckt_arr = _safe_f32(hckt, ceiling=1e10)
+    xne_arr = _safe_f32(xne, ceiling=1e30)
     xnf_arr = np.asarray(xnf, dtype=np.float64)
-    xnfdop_arr = np.asarray(xnfdop, dtype=np.float32)
-    dopple_arr = np.asarray(dopple, dtype=np.float32)
+    xnf_arr = np.where(np.isfinite(xnf_arr), xnf_arr, 0.0)
+    xnfdop_arr = _safe_f32(xnfdop)
+    dopple_arr = _safe_f32(dopple, ceiling=1e10)
 
     nrhox = int(t.size)
     numnu = int(waveset.size)
@@ -1212,10 +1238,11 @@ def linop1(
     h2tab = np.asarray(h2tab, dtype=np.float32)
 
     # Fortran: TXNXN is REAL*4 (line 9950), computed from REAL*8 then truncated
-    txnxn = np.asarray(
-        (xnf_arr[:, 0] + 0.42 * xnf_arr[:, 2] + 0.85 * xnf_arr[:, 840]) * (t / 10000.0) ** 0.3,
-        dtype=np.float32,
-    )
+    # Fix 8d: same clip pattern as above to keep cast finite.
+    _txnxn_full = (
+        xnf_arr[:, 0] + 0.42 * xnf_arr[:, 2] + 0.85 * xnf_arr[:, 840]
+    ) * (np.maximum(t, 1.0) / 10000.0) ** 0.3
+    txnxn = _safe_f32(_txnxn_full)
     start = float(waveset[max(0, int(nulo) - 1)] - 1.0)
     stop = float(waveset[min(nuhi_eff, numnu) - 1] + 1.0)
 

@@ -555,9 +555,13 @@ def _pfsaha_depth_uncached(
             continue
 
         # General interpolation path (atlas12.for lines ~3710-3733).
+        # Fix C: defensive guard so a NaN T from upstream raises a warning
+        # rather than crashing.  Shouldn't be reached now (Fix A/B in tcorr.py
+        # sanitize TCORR output), but kept as belt-and-braces.
+        t_safe = float(t) if (np.isfinite(t) and t > 0.0) else 1.0
         t2000 = max(ip_i * 2000.0 / 11.0, 1e-12)
-        it = max(1, min(9, int(t / t2000 - 0.5)))
-        dt = t / t2000 - float(it) - 0.5
+        it = max(1, min(9, int(t_safe / t2000 - 0.5)))
+        dt = t_safe / t2000 - float(it) - 0.5
         pmin = 1.0
         i = (it + 1) // 2
         nnn_i = int(NNN[i - 1, n - 1])

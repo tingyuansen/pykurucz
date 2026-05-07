@@ -345,32 +345,46 @@ def josh_depth_profiles(
     bnu = np.asarray(bnu, dtype=np.float64)
 
     if _NUMBA_AVAILABLE and not knu_log_path:
-        taunu, snu, hnu, jnu, jmins, abtot, alpha, knu_surface, maxj = _josh_depth_profiles_nb(
-            int(ifscat),
-            acont,
-            scont,
-            aline,
-            sline,
-            sigmac,
-            sigmal,
-            rhox,
-            bnu,
-            ck_weights,
-            coefh_matrix,
-            coefj_matrix,
-            xtau_grid,
-        )
-        return JoshResult(
-            taunu=taunu,
-            snu=snu,
-            hnu=hnu,
-            jnu=jnu,
-            jmins=jmins,
-            abtot=abtot,
-            alpha=alpha,
-            knu_surface=float(knu_surface),
-            maxj=int(maxj),
-        )
+        # Fix 9: numba kernel can raise ZeroDivisionError on certain (T, abundance)
+        # corners (e.g. cool-dense ΔC=-0.5/-0.6 cells with deep CN/CO chemistry
+        # producing tiny opacity in some wavelength bins).  The Python fallback
+        # below has explicit `den < 1e-300` guards in more places, so we retry
+        # via that path on numerical failure rather than killing the whole job.
+        try:
+            taunu, snu, hnu, jnu, jmins, abtot, alpha, knu_surface, maxj = _josh_depth_profiles_nb(
+                int(ifscat),
+                acont,
+                scont,
+                aline,
+                sline,
+                sigmac,
+                sigmal,
+                rhox,
+                bnu,
+                ck_weights,
+                coefh_matrix,
+                coefj_matrix,
+                xtau_grid,
+            )
+            return JoshResult(
+                taunu=taunu,
+                snu=snu,
+                hnu=hnu,
+                jnu=jnu,
+                jmins=jmins,
+                abtot=abtot,
+                alpha=alpha,
+                knu_surface=float(knu_surface),
+                maxj=int(maxj),
+            )
+        except (ZeroDivisionError, FloatingPointError, ValueError) as exc:
+            import warnings
+            warnings.warn(
+                f"josh numba kernel failed ({type(exc).__name__}: {exc}); "
+                "falling back to Python implementation",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     n = rhox.size
     abtot = np.maximum(acont + aline + sigmac + sigmal, 1e-300)
@@ -490,13 +504,26 @@ def josh_depth_profiles(
             ifneg = 1
             snubar[m0:] = bnu[m0:]
             snu[m0:] = bnu[m0:]
-        hnu[m0:] = _deriv(taunu[m0:], snu[m0:]) / 3.0
+        # Fix 12: numba-jit'd _deriv can still raise ZeroDivisionError on extreme
+        # corners despite Fix 11 guards (NaN/inf inputs propagate through the
+        # `abs(denom) < 1e-30` check unchanged).  Catch locally and substitute
+        # zeros so the JOSH back-iteration heals via the bnu initialisation.
+        try:
+            hnu[m0:] = _deriv(taunu[m0:], snu[m0:]) / 3.0
+        except (ZeroDivisionError, FloatingPointError):
+            hnu[m0:] = 0.0
         if np.any(hnu[m0:] <= 0.0):
             ifneg = 1
             snubar[m0:] = bnu[m0:]
             snu[m0:] = bnu[m0:]
-            hnu[m0:] = _deriv(taunu[m0:], snu[m0:]) / 3.0
-        jmins[nmj0:] = _deriv(taunu[nmj0:], hnu[nmj0:])
+            try:
+                hnu[m0:] = _deriv(taunu[m0:], snu[m0:]) / 3.0
+            except (ZeroDivisionError, FloatingPointError):
+                hnu[m0:] = 0.0
+        try:
+            jmins[nmj0:] = _deriv(taunu[nmj0:], hnu[nmj0:])
+        except (ZeroDivisionError, FloatingPointError):
+            jmins[nmj0:] = 0.0
         for j in range(maxj1 - 1, n):
             if ifneg == 1:
                 jmins[j] = 0.0

@@ -130,7 +130,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         convergence_min_iterations=args.convergence_min_iterations,
         convergence_consecutive=args.convergence_consecutive,
     )
-    run_atlas(cfg)
+    # Fix 10: catch ZeroDivisionError / FloatingPointError that escape josh
+    # Python fallback so the slurm task exits cleanly rather than killing the whole array.
+    try:
+        run_atlas(cfg)
+    except (ZeroDivisionError, FloatingPointError, ValueError) as exc:
+        import traceback
+        print(f"[FIX10] atlas12 failed numerically ({type(exc).__name__}): {exc}", flush=True)
+        traceback.print_exc()
+        raise SystemExit(2)
     return 0
 
 
