@@ -24,6 +24,7 @@ an **arbitrary per-element abundance pattern**, to a self-consistent
 [Get started](getting-started/installation.md){ .md-button .md-button--primary }
 [User guide](user-guide/overview.md){ .md-button }
 [Python reference](api-reference/pykurucz.md){ .md-button }
+[Paper](https://arxiv.org/abs/2603.11693){ .md-button }
 </div>
 
 <div class="pk-hero__meta" markdown>

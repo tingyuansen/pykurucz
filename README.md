@@ -106,13 +106,14 @@ scripts/download_data.py # Fetch large binaries from GitHub releases
 ## Citation
 
 ```bibtex
-@article{kim2026pykurucz,
-  title   = {pyKurucz: A Pure Python Reimplementation of Kurucz SYNTHE
-             for Stellar Spectrum Synthesis},
-  author  = {Kim, Elliot M. and Ting, Yuan-Sen},
-  journal = {Journal of Open Source Software},
-  year    = {2026},
-  note    = {in review}
+@misc{kim2026pykuruczpurepythonreimplementation,
+  title         = {pyKurucz: A Pure Python Reimplementation of Kurucz ATLAS12 and SYNTHE for Stellar Spectrum Synthesis},
+  author        = {Elliot M. Kim and Yuan-Sen Ting},
+  year          = {2026},
+  eprint        = {2603.11693},
+  archivePrefix = {arXiv},
+  primaryClass  = {astro-ph.SR},
+  url           = {https://arxiv.org/abs/2603.11693}
 }
 ```
 
