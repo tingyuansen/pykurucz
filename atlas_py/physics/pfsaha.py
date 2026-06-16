@@ -6,11 +6,20 @@ Fortran reference: `atlas12.for`, `SUBROUTINE PFSAHA` (line ~3137).
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 from .pfground import pfiron
+
+try:
+    import numba
+
+    _NUMBA_AVAILABLE = True
+except Exception:  # pragma: no cover - numba is a hard dep in practice
+    numba = None  # type: ignore[assignment]
+    _NUMBA_AVAILABLE = False
 
 _ELEMENTS: list[str] = [
     "",
@@ -675,28 +684,580 @@ def _pfsaha_depth_uncached(
     return out
 
 
-@lru_cache(maxsize=262_144)
-def _pfsaha_depth_cached(
+# ────────────────────────────────────────────────────────────────────────────
+# Numba-jitted PFSAHA hot path.
+#
+# `_pfsaha_depth_uncached` (above) is the readable reference and stays the
+# source of truth; `_pfsaha_depth_core_nb` is a line-for-line @njit replica.
+# The 1T cProfile showed PFSAHA (partition + Saha) is ~40% of the hot-star
+# ATLAS iteration and was pure Python; it is also re-run 4x inside CONVEC FD.
+# Equivalence to the Python reference is enforced by `tools/val_pfsaha_numba.py`
+# (jitted vs. original over the full IZ/ion/mode/T/Ne grid).
+#
+# Fortran ground truth: atlas12.for SUBROUTINE PFSAHA (line ~3137), PFIRON
+# (line ~16070). xnatom/xabund are intentionally absent — PFSAHA output depends
+# only on (T, Ne, IZ, nion, mode, CHARGESQ).
+# ────────────────────────────────────────────────────────────────────────────
+
+# PFIRON Debye-lowering levels (atlas12.for PFIRON), as arrays for the njit path.
+_PFIRON_POTLO_ARR = np.array(
+    [500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0, 32000.0], dtype=np.float64
+)
+_PFIRON_POTLOLOG_ARR = np.array(
+    [2.69897, 3.0, 3.30103, 3.60206, 3.90309, 4.20412, 4.50515], dtype=np.float64
+)
+_PFTAB_DUMMY = np.zeros((1, 1, 1, 1), dtype=np.float64)
+_POTION_DUMMY = np.empty(0, dtype=np.float64)
+
+
+if _NUMBA_AVAILABLE:
+
+    @numba.njit(cache=True)
+    def _special_partition_nb(n, hckt):  # noqa: C901 - mirrors Fortran branches
+        if n == 1:  # H I
+            part = 2.0
+            for i in range(1, 6):
+                part += GHYD[i] * np.exp(-EHYD[i] * hckt)
+            d1 = 109677.576 / (6.5 * 6.5) * hckt
+            return part, d1, True
+        if n == 3:  # He I
+            part = 1.0
+            for i in range(1, 29):
+                part += GHE1[i] * np.exp(-EHE1[i] * hckt)
+            d1 = 109677.576 / (5.5 * 5.5) * hckt
+            return part, d1, True
+        if n == 4:  # He II
+            part = 2.0
+            for i in range(1, 6):
+                part += GHE2[i] * np.exp(-EHE2[i] * hckt)
+            d1 = 4.0 * 109722.267 / (6.5 * 6.5) * hckt
+            return part, d1, True
+        if n == 354:  # C I
+            part = 1.0 + 3.0 * np.exp(-16.42 * hckt) + 5.0 * np.exp(-43.42 * hckt)
+            for i in range(1, 14):
+                part += GC1[i] * np.exp(-EC1[i] * hckt)
+            part += (
+                108.0 * np.exp(-80000.0 * hckt)
+                + 189.0 * np.exp(-84000.0 * hckt)
+                + 247.0 * np.exp(-87000.0 * hckt)
+                + 231.0 * np.exp(-88000.0 * hckt)
+                + 190.0 * np.exp(-89000.0 * hckt)
+                + 300.0 * np.exp(-90000.0 * hckt)
+            )
+            return part, 0.0, True
+        if n == 355:  # C II
+            part = 2.0 + 4.0 * np.exp(-63.42 * hckt)
+            for i in range(1, 6):
+                part += GC2[i] * np.exp(-EC2[i] * hckt)
+            part += (
+                6.0 * np.exp(-131731.80 * hckt)
+                + 4.0 * np.exp(-142027.1 * hckt)
+                + 10.0 * np.exp(-145550.13 * hckt)
+                + 10.0 * np.exp(-150463.62 * hckt)
+                + 2.0 * np.exp(-157234.07 * hckt)
+                + 6.0 * np.exp(-162500.0 * hckt)
+                + 42.0 * np.exp(-168000.0 * hckt)
+                + 56.0 * np.exp(-178000.0 * hckt)
+                + 102.0 * np.exp(-183000.0 * hckt)
+                + 400.0 * np.exp(-188000.0 * hckt)
+            )
+            d1 = 0.0
+            return part, d1, True
+        if n == 51:  # Mg I
+            part = 1.0
+            for i in range(1, 11):
+                part += GMG1[i] * np.exp(-EMG1[i] * hckt)
+            part += (
+                5.0 * np.exp(-53134.0 * hckt)
+                + 15.0 * np.exp(-54192.0 * hckt)
+                + 28.0 * np.exp(-54676.0 * hckt)
+                + 9.0 * np.exp(-57853.0 * hckt)
+            )
+            d1 = 109734.83 / (4.5 * 4.5) * hckt
+            return part, d1, True
+        if n == 52:  # Mg II
+            part = 2.0
+            for i in range(1, 6):
+                part += GMG2[i] * np.exp(-EMG2[i] * hckt)
+            part += (
+                10.0 * np.exp(-93310.80 * hckt)
+                + 14.0 * np.exp(-93799.70 * hckt)
+                + 6.0 * np.exp(-97464.32 * hckt)
+                + 10.0 * np.exp(-103419.82 * hckt)
+                + 14.0 * np.exp(-103689.89 * hckt)
+                + 18.0 * np.exp(-103705.66 * hckt)
+            )
+            d1 = 4.0 * 109734.83 / (5.5 * 5.5) * hckt
+            return part, d1, True
+        if n == 57:  # Al I
+            part = 2.0 + 4.0 * np.exp(-112.061 * hckt)
+            for i in range(1, 9):
+                part += GAL1[i] * np.exp(-EAL1[i] * hckt)
+            part += 10.0 * np.exp(-42235.0 * hckt) + 14.0 * np.exp(-43831.0 * hckt)
+            d1 = 109735.08 / (5.5 * 5.5) * hckt
+            return part, d1, True
+        if n == 63:  # Si I
+            part = 1.0 + 3.0 * np.exp(-77.115 * hckt) + 5.0 * np.exp(-223.157 * hckt)
+            for i in range(1, 11):
+                part += GSI1[i] * np.exp(-ESI1[i] * hckt)
+            part += (
+                76.0 * np.exp(-53000.0 * hckt)
+                + 71.0 * np.exp(-57000.0 * hckt)
+                + 191.0 * np.exp(-60000.0 * hckt)
+                + 240.0 * np.exp(-62000.0 * hckt)
+                + 251.0 * np.exp(-63000.0 * hckt)
+                + 300.0 * np.exp(-65000.0 * hckt)
+            )
+            return part, 0.0, True
+        if n == 64:  # Si II
+            part = 2.0 + 4.0 * np.exp(-287.32 * hckt)
+            for i in range(1, 6):
+                part += GSI2[i] * np.exp(-ESI2[i] * hckt)
+            part += (
+                6.0 * np.exp(-81231.59 * hckt)
+                + 6.0 * np.exp(-83937.08 * hckt)
+                + 10.0 * np.exp(-101024.09 * hckt)
+                + 14.0 * np.exp(-103556.35 * hckt)
+                + 10.0 * np.exp(-108800.0 * hckt)
+                + 42.0 * np.exp(-115000.0 * hckt)
+                + 6.0 * np.exp(-121000.0 * hckt)
+                + 38.0 * np.exp(-125000.0 * hckt)
+                + 34.0 * np.exp(-132000.0 * hckt)
+            )
+            d1 = 4.0 * 109734.83 / (4.5 * 4.5) * hckt
+            return part, d1, True
+        if n == 367:  # O I
+            part = 5.0 + 3.0 * np.exp(-158.265 * hckt) + np.exp(-226.977 * hckt)
+            for i in range(1, 13):
+                part += GO1[i] * np.exp(-EO1[i] * hckt)
+            part += (
+                15.0 * np.exp(-101140.0 * hckt)
+                + 131.0 * np.exp(-103000.0 * hckt)
+                + 128.0 * np.exp(-105000.0 * hckt)
+                + 600.0 * np.exp(-107000.0 * hckt)
+            )
+            return part, 0.0, True
+        if n == 45:  # Na I
+            part = 2.0
+            for i in range(1, 8):
+                part += GNA1[i] * np.exp(-ENA1[i] * hckt)
+            part += 10.0 * np.exp(-34548.745 * hckt) + 14.0 * np.exp(-34586.96 * hckt)
+            d1 = 109734.83 / (4.5 * 4.5) * hckt
+            return part, d1, True
+        if n == 14:  # B I
+            part = 2.0 + 4.0 * np.exp(-15.25 * hckt)
+            for i in range(1, 7):
+                part += GB1[i] * np.exp(-EB1[i] * hckt)
+            part += (
+                6.0 * np.exp(-57786.80 * hckt)
+                + 10.0 * np.exp(-59989.0 * hckt)
+                + 14.0 * np.exp(-60031.03 * hckt)
+                + 2.0 * np.exp(-63561.0 * hckt)
+            )
+            d1 = 109734.83 / (4.5 * 4.5) * hckt
+            return part, d1, True
+        if n == 91:  # K I
+            part = 2.0
+            for i in range(1, 8):
+                part += GK1[i] * np.exp(-EK1[i] * hckt)
+            part += 10.0 * np.exp(-27397.077 * hckt) + 14.0 * np.exp(-28127.85 * hckt)
+            d1 = 109734.83 / (5.5 * 5.5) * hckt
+            return part, d1, True
+        return 1.0, 0.0, False
+
+    @numba.njit(cache=True)
+    def _occupation_correction_nb(part, zion, g, ip, potlo, tv, d1):
+        if tv <= 0.0 or d1 <= 0.0 or potlo <= 0.0:
+            return max(part, 1.0)
+        d2 = potlo / tv
+        if d2 <= 0.0:
+            return max(part, 1.0)
+        x = np.sqrt(13.595 * zion * zion / (tv * d2))
+        x3 = x * x * x
+        poly = (1.0 / 3.0) + (1.0 - (0.5 + (1.0 / 18.0 + d2 / 120.0) * d2) * d2) * d2
+        term_d2 = x3 * poly
+        x = np.sqrt(13.595 * zion * zion / (tv * d1))
+        x3 = x * x * x
+        poly = (1.0 / 3.0) + (1.0 - (0.5 + (1.0 / 18.0 + d1 / 120.0) * d1) * d1) * d1
+        term_d1 = x3 * poly
+        corr = g * np.exp(-ip / tv) * (term_d2 - term_d1)
+        return max(part + corr, 1.0)
+
+    @numba.njit(cache=True)
+    def _pfiron_nb(nelem, ion, tlog10, potlow_cm1, pftab):
+        tlog = tlog10
+        if tlog > 4.0:
+            it = int((tlog - 4.0) / 0.05) + 31
+            if it > 56:
+                it = 56
+            f = (tlog - (it - 31) * 0.05 - 4.0) / 0.05
+        elif tlog < 3.7:
+            it = int((tlog - 3.32) / 0.02) + 2
+            if it < 2:
+                it = 2
+            f = (tlog - (it - 2) * 0.02 - 3.32) / 0.02
+        else:
+            it = int((tlog - 3.7) / 0.03) + 21
+            f = (tlog - (it - 21) * 0.03 - 3.7) / 0.03
+        it0 = it - 1
+        it0m1 = it0 - 1
+        ion0 = ion - 1
+        elem0 = nelem - 20
+        potlow = potlow_cm1
+        if potlow < _PFIRON_POTLO_ARR[0]:
+            return (
+                f * pftab[0, it0, ion0, elem0]
+                + (1.0 - f) * pftab[0, it0m1, ion0, elem0]
+            )
+        for low in range(2, 8):
+            if potlow < _PFIRON_POTLO_ARR[low - 1]:
+                p = (np.log10(potlow) - _PFIRON_POTLOLOG_ARR[low - 2]) / 0.30103
+                return p * (
+                    f * pftab[low - 1, it0, ion0, elem0]
+                    + (1.0 - f) * pftab[low - 1, it0m1, ion0, elem0]
+                ) + (1.0 - p) * (
+                    f * pftab[low - 2, it0, ion0, elem0]
+                    + (1.0 - f) * pftab[low - 2, it0m1, ion0, elem0]
+                )
+        return (
+            f * pftab[6, it0, ion0, elem0]
+            + (1.0 - f) * pftab[6, it0m1, ion0, elem0]
+        )
+
+    @numba.njit(cache=True)
+    def _pfsaha_depth_core_nb(
+        temperature_k,
+        electron_density_cm3,
+        iz,
+        nion,
+        mode,
+        chargesq_cm3,
+        has_chargesq,
+        potion,
+        has_potion,
+        pftab,
+    ):
+        t = temperature_k if temperature_k > 1.0 else 1.0
+        ne = electron_density_cm3 if electron_density_cm3 > 1e-40 else 1e-40
+        tk = _K_BOLTZ * t
+        tkev = _KEV_FACTOR * t
+        tk_safe = tk if tk > 1e-300 else 1e-300
+        hckt = (6.6256e-27 * 2.99792458e10) / tk_safe
+
+        mode1 = mode if mode <= 10 else mode - 10
+        return_all = mode >= 10
+
+        if not has_chargesq:
+            chargesq = 2.0 * ne
+            if chargesq < 1e-30:
+                chargesq = 1e-30
+        else:
+            chargesq = chargesq_cm3 if chargesq_cm3 > 1e-30 else 1e-30
+        debye = np.sqrt(tk / (12.5664 * (4.801e-10 ** 2) * chargesq))
+        debye_safe = debye if debye > 1e-300 else 1e-300
+        potlow = 1.44e-7 / debye_safe
+        if potlow > 1.0:
+            potlow = 1.0
+
+        # _start_and_nions(iz)
+        if iz <= 28:
+            n_start = int(LOCZ[iz - 1])
+            nions = int(LOCZ[iz] - n_start)
+        else:
+            n_start = 3 * iz + 54
+            nions = 3
+        if iz == 6:
+            n_start = 354
+            nions = 6
+        if iz == 7:
+            n_start = 360
+            nions = 6
+        if 20 <= iz < 29:
+            nions = 10
+
+        nion2 = nion + 2
+        if nion2 > nions:
+            nion2 = nions
+        n = n_start - 1
+
+        part = np.ones(nion2, dtype=np.float64)
+        ip = np.zeros(nion2, dtype=np.float64)
+        potlo = np.zeros(nion2, dtype=np.float64)
+        f = np.zeros(nion2, dtype=np.float64)
+
+        for ion in range(1, nion2 + 1):
+            zion = float(ion)
+            n += 1
+            potlo_i = potlow * zion
+            nnn6 = int(NNN[5, n - 1])
+            nnn100 = nnn6 // 100
+            g = float(nnn6 - nnn100 * 100)
+            ip_i = float(nnn100) / 1000.0
+            if has_potion:
+                if iz <= 30:
+                    pidx = iz * (iz + 1) // 2 + ion - 1 - 1
+                else:
+                    pidx = iz * 5 + 341 + ion - 1 - 1
+                if 0 <= pidx < potion.size and potion[pidx] > 0.0:
+                    ip_i = potion[pidx] / 8065.479
+                elif 0 <= pidx - 1 < potion.size and potion[pidx - 1] > 0.0:
+                    ip_i = potion[pidx - 1] / 8065.479
+            if ip_i <= 0.0 and ion > 1:
+                ip_i = ip[ion - 2]
+            potlo[ion - 1] = potlo_i
+            ip[ion - 1] = ip_i
+
+            if 20 <= iz < 29:
+                pfi = _pfiron_nb(iz, ion, np.log10(t), potlo_i * 8065.479, pftab)
+                part[ion - 1] = pfi if pfi > 1.0 else 1.0
+                continue
+
+            p_special, d1_special, used_special = _special_partition_nb(n, hckt)
+            if used_special:
+                p = p_special if p_special > 1.0 else 1.0
+                if d1_special > 0.0:
+                    g_eff = g if g > 2.0 else 2.0
+                    p = _occupation_correction_nb(
+                        p, zion, g_eff, ip_i, potlo_i, tkev, d1_special
+                    )
+                part[ion - 1] = p if p > 1.0 else 1.0
+                continue
+
+            t_safe = t if (np.isfinite(t) and t > 0.0) else 1.0
+            t2000 = ip_i * 2000.0 / 11.0
+            if t2000 < 1e-12:
+                t2000 = 1e-12
+            it = int(t_safe / t2000 - 0.5)
+            if it < 1:
+                it = 1
+            if it > 9:
+                it = 9
+            dt = t_safe / t2000 - float(it) - 0.5
+            pmin = 1.0
+            i = (it + 1) // 2
+            nnn_i = int(NNN[i - 1, n - 1])
+            k1 = nnn_i // 100000
+            k2 = nnn_i - k1 * 100000
+            k3 = k2 // 10
+            kscale = k2 - k3 * 10
+            if kscale < 1:
+                kscale = 1
+            if kscale > 4:
+                kscale = 4
+            if it % 2 == 1:
+                p1 = float(k1) * SCALE[kscale - 1]
+                p2 = float(k3) * SCALE[kscale - 1]
+                if dt < 0.0 and kscale <= 1:
+                    kp1 = int(p1)
+                    if kp1 == int(p2 + 0.5):
+                        pmin = float(kp1)
+            else:
+                p1 = float(k3) * SCALE[kscale - 1]
+                nnn_i1 = int(NNN[i, n - 1])
+                k1n = nnn_i1 // 100000
+                kscale_n = int(nnn_i1 % 10)
+                if kscale_n < 1:
+                    kscale_n = 1
+                if kscale_n > 4:
+                    kscale_n = 4
+                p2 = float(k1n) * SCALE[kscale_n - 1]
+            p = p1 + (p2 - p1) * dt
+            if p < pmin:
+                p = pmin
+
+            if t < t2000 * 2.0:
+                part[ion - 1] = p if p > 1.0 else 1.0
+                continue
+
+            if g != 0.0 and potlo_i >= 0.1 and t >= t2000 * 4.0:
+                tv_eff = tkev
+                if t > (t2000 * 11.0):
+                    tv_eff = (t2000 * 11.0) * _KEV_FACTOR
+                tv_safe = tv_eff if tv_eff > 1e-30 else 1e-30
+                d1 = 0.1 / tv_safe
+                p = _occupation_correction_nb(p, zion, g, ip_i, potlo_i, tv_eff, d1)
+            part[ion - 1] = p if p > 1.0 else 1.0
+
+        if mode1 != 3 and mode1 != 5:
+            tkev_safe = tkev if tkev > 1e-30 else 1e-30
+            cf = 2.0 * 2.4148e15 * t * np.sqrt(t) / ne
+            for ion in range(2, nion2 + 1):
+                idx = ion - 1
+                denom = part[idx - 1] if part[idx - 1] > 1e-300 else 1e-300
+                f[idx] = (
+                    cf
+                    * part[idx]
+                    / denom
+                    * np.exp(-(ip[idx - 1] - potlo[idx - 1]) / tkev_safe)
+                )
+            f[0] = 1.0
+            ll = nion2 + 1
+            for _ in range(2, nion2 + 1):
+                ll -= 1
+                f[0] = 1.0 + f[ll - 1] * f[0]
+            f0d = f[0] if f[0] > 1e-300 else 1e-300
+            f[0] = 1.0 / f0d
+            for ion in range(2, nion2 + 1):
+                idx = ion - 1
+                f[idx] = f[idx - 1] * f[idx]
+
+        nret = nion if nion < nion2 else nion2
+        if return_all:
+            if mode1 == 1:
+                out = np.zeros(nion, dtype=np.float64)
+                for k in range(nret):
+                    pden = part[k] if part[k] > 1e-300 else 1e-300
+                    out[k] = f[k] / pden
+                return out
+            if mode1 == 2:
+                out = np.zeros(nion, dtype=np.float64)
+                for k in range(nret):
+                    out[k] = f[k]
+                return out
+            if mode1 == 3:
+                out = np.zeros(nion, dtype=np.float64)
+                for k in range(nret):
+                    out[k] = part[k]
+                return out
+            if mode1 == 4:
+                out = np.zeros(nion, dtype=np.float64)
+                s = 0.0
+                for k in range(1, nion2):
+                    s += f[k] * float(k)
+                out[0] = s
+                return out
+            # mode1 == 5
+            out = np.zeros(61, dtype=np.float64)
+            for k in range(nret):
+                out[k] = part[k]
+            out[31] = 0.0
+            eacc = 0.0
+            for ii in range(nret):
+                eacc += ip[ii]
+                if 32 + ii < out.size:
+                    out[32 + ii] = eacc
+            return out
+
+        nidx = nion if nion > 1 else 1
+        if nidx > nion2:
+            nidx = nion2
+        nidx -= 1
+        if mode1 == 1:
+            out = np.zeros(nion, dtype=np.float64)
+            pden = part[nidx] if part[nidx] > 1e-300 else 1e-300
+            out[0] = f[nidx] / pden
+            return out
+        if mode1 == 2:
+            out = np.zeros(nion, dtype=np.float64)
+            out[0] = f[nidx]
+            return out
+        if mode1 == 3:
+            out = np.zeros(nion, dtype=np.float64)
+            out[0] = part[nidx]
+            return out
+        if mode1 == 4:
+            out = np.zeros(nion, dtype=np.float64)
+            s = 0.0
+            for k in range(1, nion2):
+                s += f[k] * float(k)
+            out[0] = s
+            return out
+        # mode1 == 5
+        out = np.zeros(61, dtype=np.float64)
+        for k in range(nret):
+            out[k] = part[k]
+        out[31] = 0.0
+        eacc = 0.0
+        for ii in range(nret):
+            eacc += ip[ii]
+            if 32 + ii < out.size:
+                out[32 + ii] = eacc
+        return out
+
+
+def _pfsaha_depth_fast(
     temperature_k: float,
     electron_density_cm3: float,
-    xnatom_cm3: float,
-    xabund_linear: float,
     atomic_number: int,
     nion: int,
     mode: int,
     chargesq_cm3: float | None,
-) -> tuple[float, ...]:
-    out = _pfsaha_depth_uncached(
+) -> np.ndarray:
+    """Numba-accelerated PFSAHA; identical math to `_pfsaha_depth_uncached`."""
+    iz = int(atomic_number)
+    if iz < 1 or iz >= len(_ELEMENTS):  # match _element_symbol() range check
+        raise ValueError(f"Atomic number out of supported range: {iz}")
+    if not _NUMBA_AVAILABLE:
+        return _pfsaha_depth_uncached(
+            temperature_k=temperature_k,
+            electron_density_cm3=electron_density_cm3,
+            xnatom_cm3=0.0,
+            xabund_linear=0.0,
+            atomic_number=iz,
+            nion=nion,
+            mode=mode,
+            chargesq_cm3=chargesq_cm3,
+        )
+    if 20 <= iz < 29:
+        from .pfground import _get_pftab
+
+        pftab = np.ascontiguousarray(_get_pftab(), dtype=np.float64)
+    else:
+        pftab = _PFTAB_DUMMY
+    has_potion = POTION is not None
+    potion = POTION if has_potion else _POTION_DUMMY
+    has_cs = chargesq_cm3 is not None
+    cs = float(chargesq_cm3) if has_cs else 0.0
+    return _pfsaha_depth_core_nb(
+        float(temperature_k),
+        float(electron_density_cm3),
+        iz,
+        int(nion),
+        int(mode),
+        cs,
+        has_cs,
+        potion,
+        has_potion,
+        pftab,
+    )
+
+
+@lru_cache(maxsize=262_144)
+def _pfsaha_depth_cached(
+    temperature_k: float,
+    electron_density_cm3: float,
+    atomic_number: int,
+    nion: int,
+    mode: int,
+    chargesq_cm3: float | None,
+) -> np.ndarray:
+    # NOTE: xnatom_cm3 / xabund_linear are intentionally NOT part of the cache
+    # key. `_pfsaha_depth_uncached` discards them (line ~479) — the PFSAHA
+    # output depends only on (T, Ne, IZ, nion, mode, CHARGESQ). Keeping them in
+    # the key only manufactured spurious cache misses.
+    #
+    # Hot path: `_pfsaha_depth_fast` is the @njit replica of
+    # `_pfsaha_depth_uncached` (verified bit-equivalent by
+    # tools/val_pfsaha_numba.py). It falls back to the pure-Python reference
+    # automatically when numba is unavailable.
+    out = _pfsaha_depth_fast(
         temperature_k=temperature_k,
         electron_density_cm3=electron_density_cm3,
-        xnatom_cm3=xnatom_cm3,
-        xabund_linear=xabund_linear,
         atomic_number=atomic_number,
         nion=nion,
         mode=mode,
         chargesq_cm3=chargesq_cm3,
     )
-    return tuple(float(x) for x in out)
+    # Cache a read-only float64 array directly. The previous implementation
+    # round-tripped through `tuple(float(x) for x in out)` on every miss
+    # (~12M float() calls / iter; ~1.3 s/iter of pure marshalling per the
+    # 1T cProfile). Storing the ndarray and returning a copy in the public
+    # wrapper is bit-for-bit identical (out is already float64) but skips the
+    # tuple<->array conversion entirely. The cached array is frozen so shared
+    # callers cannot mutate it.
+    out = np.ascontiguousarray(out, dtype=np.float64)
+    out.setflags(write=False)
+    return out
 
 
 def pfsaha_depth(
@@ -712,18 +1273,16 @@ def pfsaha_depth(
     """Compute PFSAHA-like output for one depth and one element.
 
     The scalar PFSAHA result is reused heavily by NMOLEC Newton iterations for
-    identical thermodynamic inputs. Cache immutable tuples and return a fresh
-    array so callers retain the original mutable-array contract.
+    identical thermodynamic inputs. Cache an immutable array and return a fresh
+    writable copy so callers retain the original mutable-array contract.
     """
     cached = _pfsaha_depth_cached(
         float(temperature_k),
         float(electron_density_cm3),
-        float(xnatom_cm3),
-        float(xabund_linear),
         int(atomic_number),
         int(nion),
         int(mode),
         None if chargesq_cm3 is None else float(chargesq_cm3),
     )
-    return np.asarray(cached, dtype=np.float64)
+    return np.array(cached, dtype=np.float64)
 
