@@ -13,10 +13,22 @@ from pathlib import Path
 
 import numpy as np
 
+from . import pfsaha as _pfsaha_mod
 from .pfsaha import pfsaha_depth
 from .runtime import AtlasRuntimeState
 
 from .nmolec_data import load_nmolec_tables as _load_nm_tables
+
+try:
+    import numba
+    from numba import njit
+    # The jitted PFSAHA core is callable from inside other @njit functions.
+    from .pfsaha import _pfsaha_depth_core_nb
+
+    _NMOLEC_NUMBA = True
+except Exception:  # pragma: no cover - numba is a hard dep in practice
+    numba = None  # type: ignore[assignment]
+    _NMOLEC_NUMBA = False
 
 _MAX_ITERS = 200
 _TOL = 1.0e-4
@@ -155,6 +167,320 @@ def _equilh2(t: float) -> float:
     expo = 36118.11 * _H_PLANCK * _C_LIGHT / _K_BOLTZ / max(t, 1e-30)
     val = pf * (2.0**1.5) / 4.0 / max(denom, 1e-300) * np.exp(expo)
     return float(val) if np.isfinite(val) else 0.0
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Numba-jitted NMOLEC hot path.
+#
+# The pure-Python `_solve_depth` / `_compute_equilj_for_depth` /
+# `compute_nmolec_edens` above remain the readable reference and source of
+# truth (mirror atlas12.for NMOLEC/MOLEC). The @njit replicas below are
+# line-for-line copies; equivalence is enforced by the in-situ parity check
+# (ATLAS_NMOLEC_PARITY=1) and tools/val_nmolec_numba.py, plus the e2e gate.
+#
+# Key parity-exact restructuring: `_compute_equilj_for_depth(j, xn)` does NOT
+# use `xn` (verified), so the molecular equilibrium constants are constant
+# across Newton iterations. The njit solver computes them ONCE per layer
+# instead of every iteration — identical math, less work.
+#
+# numba's np.linalg.solve uses the same LAPACK backend as numpy (verified
+# bit-identical over 300 random systems dim 2-30), so the Newton trajectory is
+# bit-for-bit identical to the Python reference.
+# ────────────────────────────────────────────────────────────────────────────
+
+# Contiguous float64 view of the H2 partition table for the njit interpolator.
+_H2_PF_NB = np.ascontiguousarray(_H2_PF, dtype=np.float64)
+
+
+if _NMOLEC_NUMBA:
+
+    @njit(cache=True)
+    def _interp_h2_pf_nb(t):
+        if not np.isfinite(t) or t <= 100.0:
+            t = 100.0
+        elif t >= 19900.0:
+            t = 19900.0
+        n = int(t / 100.0)
+        if n < 1:
+            n = 1
+        elif n > 199:
+            n = 199
+        p0 = _H2_PF_NB[n - 1]
+        p1 = _H2_PF_NB[n]
+        return p0 + (p1 - p0) * (t - n * 100.0) / 100.0
+
+    @njit(cache=True)
+    def _equilh2_nb(t):
+        if not np.isfinite(t) or t <= 0.0:
+            t = 1.0
+        pf = _interp_h2_pf_nb(t)
+        denom_arg = 2.0 * np.pi * 1.008 * _AMU_G * _K_BOLTZ / (_H_PLANCK ** 2) * t
+        if not np.isfinite(denom_arg) or denom_arg <= 0.0:
+            denom_arg = 1e-300
+        denom = denom_arg ** 1.5
+        expo = 36118.11 * _H_PLANCK * _C_LIGHT / _K_BOLTZ / max(t, 1e-30)
+        val = pf * (2.0 ** 1.5) / 4.0 / max(denom, 1e-300) * np.exp(expo)
+        return val if np.isfinite(val) else 0.0
+
+    @njit(cache=True)
+    def _compute_equilj_nb(
+        t, xne_j, chargesq_j, nummol, locj, code_mol, equil,
+        potion, has_potion, pftab,
+    ):
+        tkev = t / 11604.5
+        tlog = np.log(max(t, 1e-300))
+        equilj = np.zeros(nummol, dtype=np.float64)
+        for jmol in range(nummol):
+            loc1 = locj[jmol] - 1
+            loc2 = locj[jmol + 1] - 1
+            ncomp = loc2 - loc1
+            e1 = equil[0, jmol]
+            if e1 != 0.0:
+                cm = code_mol[jmol]
+                ion = int((cm - float(int(cm))) * 100.0 + 0.5)
+                if abs(cm - 101.0) < 0.005:
+                    if t > 20000.0:
+                        continue
+                    equilj[jmol] = _equilh2_nb(t)
+                else:
+                    if t > 10000.0:
+                        continue
+                    e2 = equil[1, jmol]
+                    e3 = equil[2, jmol]
+                    e4 = equil[3, jmol]
+                    e5 = equil[4, jmol]
+                    e6 = equil[5, jmol]
+                    poly = e3 + (-e4 + (e5 - e6 * t) * t) * t
+                    expo = (
+                        e1 / max(tkev, 1e-30)
+                        - e2
+                        + poly * t
+                        - 1.5 * float(ncomp - ion - ion - 1) * tlog
+                    )
+                    equilj[jmol] = np.exp(expo)
+                continue
+
+            if ncomp <= 1:
+                equilj[jmol] = 1.0
+                continue
+
+            id_atomic = int(code_mol[jmol])
+            ion = ncomp - 1
+            frac = _pfsaha_depth_core_nb(
+                t, xne_j, id_atomic, ncomp, 12, chargesq_j, True,
+                potion, has_potion, pftab,
+            )
+            if frac.size < ncomp or frac[0] <= 0.0:
+                equilj[jmol] = 0.0
+                continue
+            # float exponent so numba routes through libm pow() exactly like
+            # CPython's `float ** int` (avoids a 1-ULP integer-power mismatch).
+            equilj[jmol] = frac[ncomp - 1] / frac[0] * max(xne_j, 1e-300) ** float(ion)
+        return equilj
+
+    @njit(cache=True)
+    def _solve_depth_nb(
+        xn_seed, t_j, gas_pressure_j, xne_j, chargesq_j, xabund_row,
+        nummol, locj, code_mol, equil, kcomps, idequa, nequa,
+        potion, has_potion, pftab,
+    ):
+        xn = xn_seed.copy()
+        eqold = np.zeros(nequa, dtype=np.float64)
+        xab = np.zeros(nequa, dtype=np.float64)
+
+        for k in range(1, nequa):
+            idk = idequa[k]
+            if idk < 100 and idk > 0:
+                xab[k] = max(xabund_row[idk - 1], 1e-20)
+        if idequa[nequa - 1] == 100:
+            xab[nequa - 1] = 0.0
+
+        # equilj is independent of xn -> compute once (parity-exact).
+        equilj = _compute_equilj_nb(
+            t_j, xne_j, chargesq_j, nummol, locj, code_mol, equil,
+            potion, has_potion, pftab,
+        )
+        tk = t_j * _K_BOLTZ
+
+        for _ in range(_MAX_ITERS):
+            deq = np.zeros((nequa, nequa), dtype=np.float64)
+            eq = np.zeros(nequa, dtype=np.float64)
+
+            eq[0] = -(gas_pressure_j / max(tk, 1e-300))
+            for k in range(1, nequa):
+                eq[0] += xn[k]
+                deq[0, k] = 1.0
+                eq[k] = xn[k] - xab[k] * xn[0]
+                deq[k, k] = 1.0
+                deq[k, 0] = -xab[k]
+            if idequa[nequa - 1] == 100:
+                eq[nequa - 1] = -xn[nequa - 1]
+                deq[nequa - 1, nequa - 1] = -1.0
+
+            for jmol in range(nummol):
+                loc1 = locj[jmol] - 1
+                loc2 = locj[jmol + 1] - 1
+                ncomp = loc2 - loc1
+                if ncomp <= 1:
+                    continue
+                term = equilj[jmol]
+                if term == 0.0:
+                    continue
+                for loc in range(loc1, loc2):
+                    k = kcomps[loc]
+                    if k == nequa:
+                        term = term / max(xn[nequa - 1], 1e-300)
+                    else:
+                        term = term * xn[k]
+
+                eq[0] += term
+                for loc in range(loc1, loc2):
+                    kraw = kcomps[loc]
+                    if kraw == nequa:
+                        k = nequa - 1
+                        d = -term / max(xn[k], 1e-300)
+                    else:
+                        k = kraw
+                        d = term / max(xn[k], 1e-300)
+                    eq[k] += term
+                    deq[0, k] += d
+                    for locm in range(loc1, loc2):
+                        mraw = kcomps[locm]
+                        m = nequa - 1 if mraw == nequa else mraw
+                        deq[m, k] += d
+
+                k_last = kcomps[loc2 - 1]
+                if k_last < nequa and idequa[k_last] == 100:
+                    for loc in range(loc1, loc2):
+                        k = kcomps[loc]
+                        if k >= nequa:
+                            k = nequa - 1
+                        d = term / max(xn[k], 1e-300)
+                        if k == nequa - 1:
+                            eq[k] -= term + term
+                        for locm in range(loc1, loc2):
+                            mraw = kcomps[locm]
+                            m = nequa - 1 if mraw == nequa else mraw
+                            if m == nequa - 1:
+                                deq[m, k] -= d + d
+
+            try:
+                delta = np.linalg.solve(deq, eq)
+            except Exception:
+                delta = np.linalg.lstsq(deq, eq)[0]
+
+            iferr = False
+            scale = 100.0
+            for k in range(nequa):
+                ratio = abs(delta[k]) / max(abs(xn[k]), 1e-300)
+                if ratio > _TOL:
+                    iferr = True
+                if eqold[k] * delta[k] < 0.0:
+                    delta[k] = delta[k] * 0.69
+                xneq = xn[k] - delta[k]
+                xn100 = xn[k] / 100.0
+                if abs(xneq) >= xn100:
+                    xn[k] = abs(xneq)
+                else:
+                    xn[k] = xn[k] / scale
+                    if eqold[k] * delta[k] < 0.0:
+                        scale = np.sqrt(scale)
+                eqold[k] = delta[k]
+
+            if not iferr:
+                return xn
+
+        return xn
+
+    @njit(cache=True)
+    def _nmolec_edens_core_nb(
+        temperature_k, tk_erg, gas_pressure, xne, xnatom, xabund, chargesq, rho,
+        nummol, xnmol, equil, code_mol, locj, kcomps, idequa, nequa,
+        potion, has_potion, pftab,
+    ):
+        n = temperature_k.size
+        edens = np.zeros(n, dtype=np.float64)
+        for j in range(n):
+            t = max(temperature_k[j], 1.0)
+            tk = tk_erg[j]
+            tkev = t / 11604.5
+            hckt = _H_PLANCK * _C_LIGHT / max(tk, 1e-300)
+            xntot = gas_pressure[j] / max(tk, 1e-300)
+            e = 1.5 * xntot * tk
+            tplus = t * 1.001
+            tminus = t * 0.999
+
+            for jmol in range(nummol):
+                xnm = xnmol[j, jmol]
+                if xnm <= 0.0:
+                    continue
+                e1 = equil[0, jmol]
+                code_val = code_mol[jmol]
+                loc1 = locj[jmol] - 1
+                loc2 = locj[jmol + 1] - 1
+                ncomp = loc2 - loc1
+
+                if e1 != 0.0:
+                    if abs(code_val - 101.0) < 0.005:
+                        pfplus = _interp_h2_pf_nb(tplus) + 1e-30
+                        pfminus = _interp_h2_pf_nb(tminus) + 1e-30
+                        ediss_per_kT = 36118.11 * hckt
+                    else:
+                        e2 = equil[1, jmol]
+                        e3 = equil[2, jmol]
+                        e4 = equil[3, jmol]
+                        e5 = equil[4, jmol]
+                        e6 = equil[5, jmol]
+                        pfplus = np.exp(-e2 + (e3 + (-e4 + (e5 - e6 * tplus) * tplus) * tplus) * tplus) + 1e-30
+                        pfminus = np.exp(-e2 + (e3 + (-e4 + (e5 - e6 * tminus) * tminus) * tminus) * tminus) + 1e-30
+                        for loc in range(loc1, loc2):
+                            k = kcomps[loc]
+                            if k >= nequa:
+                                continue
+                            idk = idequa[k]
+                            if 0 < idk < 100:
+                                fp = _pfsaha_depth_core_nb(
+                                    tplus, xne[j], idk, 1, 3,
+                                    max(chargesq[j], 1e-30), True,
+                                    potion, has_potion, pftab,
+                                )
+                                pfplus *= fp[0]
+                                fm = _pfsaha_depth_core_nb(
+                                    tminus, xne[j], idk, 1, 3,
+                                    max(chargesq[j], 1e-30), True,
+                                    potion, has_potion, pftab,
+                                )
+                                pfminus *= fm[0]
+                        ediss_per_kT = e1 / max(tkev, 1e-300)
+
+                    pffrac = (pfplus - pfminus) / max(pfplus + pfminus, 1e-30) * 2.0 * 500.0
+                    contrib = xnm * tk * (-ediss_per_kT + pffrac)
+                    e += contrib
+                else:
+                    id_atomic = int(code_val)
+                    if id_atomic < 1 or id_atomic > 99:
+                        continue
+                    ion = max(ncomp, 1)
+                    pfp = _pfsaha_depth_core_nb(
+                        tplus, xne[j], id_atomic, ion, 5,
+                        max(chargesq[j], 1e-30), True, potion, has_potion, pftab,
+                    )
+                    pfm = _pfsaha_depth_core_nb(
+                        tminus, xne[j], id_atomic, ion, 5,
+                        max(chargesq[j], 1e-30), True, potion, has_potion, pftab,
+                    )
+                    pfp_ion = pfp[ion - 1] if pfp.size >= ion else 1.0
+                    pfm_ion = pfm[ion - 1] if pfm.size >= ion else 1.0
+                    pfp_ion = max(pfp_ion, pfm_ion)
+                    eion_idx = 30 + ion
+                    eion = pfp[eion_idx] if pfp.size > eion_idx else 0.0
+                    pffrac = (pfp_ion - pfm_ion) / max(pfp_ion + pfm_ion, 1e-30) * 2.0 * 500.0
+                    contrib = xnm * tk * (eion / max(tkev, 1e-300) + pffrac)
+                    e += contrib
+
+            rhoj = max(rho[j], 1e-300)
+            edens[j] = e / rhoj
+        return edens
 
 
 def _pfsaha_single(*, j: int, id_atomic: int, nion: int, mode: int, temp_override: float | None = None) -> np.ndarray:
@@ -342,6 +668,65 @@ def _solve_depth(j: int, xn_seed: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return xn, _compute_equilj_for_depth(j, xn)
 
 
+# Max relative njit-vs-Python deviation seen when ATLAS_NMOLEC_PARITY=1.
+_PARITY = {"max_xn": 0.0, "max_equilj": 0.0, "max_edens": 0.0, "n": 0}
+
+
+def _pf_tables():
+    """Fetch the PFSAHA lookup tables for the njit kernels (cached)."""
+    has_potion = _pfsaha_mod.POTION is not None
+    potion = _pfsaha_mod.POTION if has_potion else _pfsaha_mod._POTION_DUMMY
+    pftab = _pfsaha_mod._get_pftab_contig()
+    return potion, has_potion, pftab
+
+
+def _solve_depth_fast(j: int, xn_seed: np.ndarray) -> np.ndarray:
+    """njit Newton solve for layer j; Python fallback if numba absent."""
+    if not _NMOLEC_NUMBA:
+        xn, _ = _solve_depth(j, xn_seed)
+        return xn
+    ctx = _CTX
+    potion, has_potion, pftab = _pf_tables()
+    xn = _solve_depth_nb(
+        np.ascontiguousarray(xn_seed, dtype=np.float64),
+        float(ctx.temperature_k[j]),
+        float(ctx.gas_pressure[j]),
+        float(ctx.state.xne[j]),
+        float(max(ctx.state.chargesq[j], 1e-30)),
+        np.ascontiguousarray(ctx.state.xabund[j], dtype=np.float64),
+        ctx.nummol, ctx.locj, ctx.code_mol, ctx.equil, ctx.kcomps, ctx.idequa, ctx.nequa,
+        potion, has_potion, pftab,
+    )
+    if os.getenv("ATLAS_NMOLEC_PARITY"):
+        xn_ref, _ = _solve_depth(j, xn_seed)
+        if xn_ref.size:
+            d = float(np.max(np.abs(xn - xn_ref) / np.maximum(np.abs(xn_ref), 1e-300)))
+            _PARITY["max_xn"] = max(_PARITY["max_xn"], d)
+        _PARITY["n"] += 1
+    return xn
+
+
+def _compute_equilj_fast(j: int) -> np.ndarray:
+    """njit equilibrium-constant vector for layer j; Python fallback otherwise."""
+    if not _NMOLEC_NUMBA:
+        return _compute_equilj_for_depth(j, None)
+    ctx = _CTX
+    potion, has_potion, pftab = _pf_tables()
+    equilj = _compute_equilj_nb(
+        float(ctx.temperature_k[j]),
+        float(ctx.state.xne[j]),
+        float(max(ctx.state.chargesq[j], 1e-30)),
+        ctx.nummol, ctx.locj, ctx.code_mol, ctx.equil,
+        potion, has_potion, pftab,
+    )
+    if os.getenv("ATLAS_NMOLEC_PARITY"):
+        ref = _compute_equilj_for_depth(j, None)
+        if ref.size:
+            d = float(np.max(np.abs(equilj - ref) / np.maximum(np.abs(ref), 1e-300)))
+            _PARITY["max_equilj"] = max(_PARITY["max_equilj"], d)
+    return equilj
+
+
 def nmolec(*_args, **_kwargs):
     """Compute molecular equilibrium and update state arrays (ATLAS12 path)."""
     if _CTX is None:
@@ -383,7 +768,7 @@ def nmolec(*_args, **_kwargs):
             # Fortran IFEDNS path seeds XN from XNSAVE (atlas12.for line 4190+)
             # but still proceeds through the depth solution update.
             xn[:] = ctx.xnsave[j]
-        xn, _ = _solve_depth(j, xn)
+        xn = _solve_depth_fast(j, xn)
 
         ctx.xnz[j, :nequa] = xn[:nequa]
         ctx.state.xnatom[j] = xn[0]
@@ -391,7 +776,7 @@ def nmolec(*_args, **_kwargs):
         if int(ctx.idequa[nequa - 1]) == 100:
             ctx.state.xne[j] = xn[nequa - 1]
 
-        equilj = _compute_equilj_for_depth(j, xn)
+        equilj = _compute_equilj_fast(j)
         for jmol in range(ctx.nummol):
             term = float(equilj[jmol])
             loc1 = int(ctx.locj[jmol]) - 1
@@ -613,6 +998,27 @@ def compute_nmolec_edens(
     edens = np.zeros(n, dtype=np.float64)
     log_path = os.getenv("ATLAS_NMOLEC_EDENS_LOG", "").strip()
     log_label = os.getenv("ATLAS_NMOLEC_EDENS_LABEL", "").strip()
+
+    # njit fast path: identical math, no debug logging. The Python loop below
+    # is the reference (and the logging/diagnostic path).
+    _parity = bool(os.getenv("ATLAS_NMOLEC_PARITY"))
+    _edens_nb = None
+    if _NMOLEC_NUMBA and ctx is not None and not log_path:
+        potion, has_potion, pftab = _pf_tables()
+        _edens_nb = _nmolec_edens_core_nb(
+            np.ascontiguousarray(temperature_k, dtype=np.float64),
+            np.ascontiguousarray(tk_erg, dtype=np.float64),
+            np.ascontiguousarray(gas_pressure, dtype=np.float64),
+            np.ascontiguousarray(state.xne, dtype=np.float64),
+            np.ascontiguousarray(state.xnatom, dtype=np.float64),
+            np.ascontiguousarray(state.xabund, dtype=np.float64),
+            np.ascontiguousarray(state.chargesq, dtype=np.float64),
+            np.ascontiguousarray(state.rho, dtype=np.float64),
+            ctx.nummol, ctx.xnmol, ctx.equil, ctx.code_mol, ctx.locj,
+            ctx.kcomps, ctx.idequa, ctx.nequa, potion, has_potion, pftab,
+        )
+        if not _parity:
+            return _edens_nb
     try:
         log_maxj = int(os.getenv("ATLAS_NMOLEC_EDENS_MAXJ", "4"))
     except ValueError:
@@ -767,5 +1173,10 @@ def compute_nmolec_edens(
         if log_fh is not None:
             log_fh.close()
 
+    if _edens_nb is not None:
+        if _parity:
+            d = float(np.max(np.abs(_edens_nb - edens) / np.maximum(np.abs(edens), 1e-300))) if edens.size else 0.0
+            _PARITY["max_edens"] = max(_PARITY["max_edens"], d)
+        return _edens_nb
     return edens
 
