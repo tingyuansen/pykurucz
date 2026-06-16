@@ -709,6 +709,21 @@ _PFIRON_POTLOLOG_ARR = np.array(
 _PFTAB_DUMMY = np.zeros((1, 1, 1, 1), dtype=np.float64)
 _POTION_DUMMY = np.empty(0, dtype=np.float64)
 
+# Contiguous float64 view of the iron-group PFTAB, built once. The hot path
+# (iron-group elements) used to re-wrap _get_pftab() via np.ascontiguousarray
+# on *every* call (~111k calls / 3 iters ≈ 0.86 s/iter of pure no-op copy-check
+# per the t08250 1T cProfile). PFTAB is a static lookup table, so cache it.
+_PFTAB_CONTIG: np.ndarray | None = None
+
+
+def _get_pftab_contig() -> np.ndarray:
+    global _PFTAB_CONTIG
+    if _PFTAB_CONTIG is None:
+        from .pfground import _get_pftab
+
+        _PFTAB_CONTIG = np.ascontiguousarray(_get_pftab(), dtype=np.float64)
+    return _PFTAB_CONTIG
+
 
 if _NUMBA_AVAILABLE:
 
@@ -1199,9 +1214,7 @@ def _pfsaha_depth_fast(
             chargesq_cm3=chargesq_cm3,
         )
     if 20 <= iz < 29:
-        from .pfground import _get_pftab
-
-        pftab = np.ascontiguousarray(_get_pftab(), dtype=np.float64)
+        pftab = _get_pftab_contig()
     else:
         pftab = _PFTAB_DUMMY
     has_potion = POTION is not None
