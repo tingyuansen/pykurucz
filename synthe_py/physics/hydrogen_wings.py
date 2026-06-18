@@ -414,7 +414,88 @@ HIGH_LEVEL_TERMS_ARRAY = np.array(HIGH_LEVEL_TERMS, dtype=np.float64)
 LOW_LEVEL_TERMS_ARRAY = np.array(LOW_LEVEL_TERMS, dtype=np.float64)
 
 
-@jit(nopython=True, parallel=True)
+@jit(nopython=True, parallel=True, cache=True)
+def _precompute_karsas_sigma(
+    freq: np.ndarray,
+    waveno: np.ndarray,
+    high_level_terms: np.ndarray,
+    low_level_terms: np.ndarray,
+    lyman_limit: float,
+    freq_log_table: np.ndarray,
+    xn_log_table: np.ndarray,
+    xl_log_array: np.ndarray,
+    ekarsas_table: np.ndarray,
+    ln10: float,
+):
+    """Precompute Karsas cross-sections for all wavelengths (depth-independent).
+
+    Returns sigma_high[n_high, nfreq], sigma_low[n_low, nfreq], sigma_lyman[nfreq],
+    and active masks for threshold checks.
+    """
+    nfreq = freq.size
+    n_high = high_level_terms.shape[0]
+    n_low = low_level_terms.shape[0]
+
+    sigma_high = np.zeros((n_high, nfreq), dtype=np.float64)
+    sigma_low = np.zeros((n_low, nfreq), dtype=np.float64)
+    sigma_lyman = np.zeros(nfreq, dtype=np.float64)
+    # For each wavelength, store how many high/low terms are active
+    # (terms are ordered by decreasing threshold, so once wn < threshold, all
+    # subsequent terms are also inactive)
+    n_active_high = np.zeros(nfreq, dtype=np.int64)
+    n_active_low = np.zeros(nfreq, dtype=np.int64)
+    lyman_active = np.zeros(nfreq, dtype=np.bool_)
+
+    for k in prange(nfreq):
+        f = freq[k]
+        if f <= 0.0:
+            continue
+
+        wn = waveno[k]
+
+        # High-level terms (N=7-15)
+        count_h = 0
+        for i in range(n_high):
+            n = int(high_level_terms[i, 0])
+            threshold = high_level_terms[i, 1]
+            if wn < threshold:
+                break
+            sigma = _xkarsas_jit(
+                f, 1.0, n, n,
+                freq_log_table, xn_log_table, xl_log_array, ekarsas_table, ln10,
+            )
+            sigma_high[i, k] = sigma
+            count_h = i + 1
+        n_active_high[k] = count_h
+
+        # Low-level terms (N=2-6)
+        count_l = 0
+        for i in range(n_low):
+            n = int(low_level_terms[i, 0])
+            threshold = low_level_terms[i, 1]
+            if wn < threshold:
+                break
+            sigma = _xkarsas_jit(
+                f, 1.0, n, n,
+                freq_log_table, xn_log_table, xl_log_array, ekarsas_table, ln10,
+            )
+            sigma_low[i, k] = sigma
+            count_l = i + 1
+        n_active_low[k] = count_l
+
+        # Lyman limit (N=1)
+        if wn >= lyman_limit:
+            sigma = _xkarsas_jit(
+                f, 1.0, 1, 1,
+                freq_log_table, xn_log_table, xl_log_array, ekarsas_table, ln10,
+            )
+            sigma_lyman[k] = sigma
+            lyman_active[k] = True
+
+    return sigma_high, sigma_low, sigma_lyman, n_active_high, n_active_low, lyman_active
+
+
+@jit(nopython=True, parallel=True, cache=True)
 def _compute_hydrogen_continuum_kernel(
     freq: np.ndarray,
     waveno: np.ndarray,
@@ -432,20 +513,23 @@ def _compute_hydrogen_continuum_kernel(
     rydberg_cm: float,
     lyman_limit: float,
     base_limit: float,
-    freq_log_table: np.ndarray,
-    xn_log_table: np.ndarray,
-    xl_log_array: np.ndarray,
-    ekarsas_table: np.ndarray,
-    ln10: float,
+    # Precomputed Karsas tables (depth-independent)
+    sigma_high: np.ndarray,
+    sigma_low: np.ndarray,
+    sigma_lyman: np.ndarray,
+    n_active_high: np.ndarray,
+    n_active_low: np.ndarray,
+    lyman_active: np.ndarray,
 ):
-    """JIT-compiled kernel for hydrogen continuum computation."""
+    """JIT-compiled kernel for hydrogen continuum computation.
+
+    Uses precomputed Karsas cross-sections (depth-independent) to avoid
+    redundant binary-search lookups inside the depth loop.
+    """
     layers = xnfph.shape[0]
     nfreq = freq.size
     ahyd = np.zeros((layers, nfreq), dtype=np.float64)
     shyd = np.zeros((layers, nfreq), dtype=np.float64)
-
-    n_high = high_level_terms.shape[0]
-    n_low = low_level_terms.shape[0]
 
     for k in prange(nfreq):
         f = freq[k]
@@ -454,6 +538,9 @@ def _compute_hydrogen_continuum_kernel(
 
         wn = waveno[k]
         f3 = freq3[k]
+        n_ah = n_active_high[k]
+        n_al = n_active_low[k]
+        ly_active = lyman_active[k]
 
         for j in range(layers):
             stim_j = stim[j, k]
@@ -472,58 +559,25 @@ def _compute_hydrogen_continuum_kernel(
             h_val = prefactor * (exp_lo - exp_hi) * stim_j
             s_val = h_val * bnu_j
 
-            # High-level terms (N=7-15)
-            for i in range(n_high):
-                n = int(high_level_terms[i, 0])
-                threshold = high_level_terms[i, 1]
-                coeff = high_level_terms[i, 2]
-                exponent = high_level_terms[i, 3]
-
-                if wn < threshold:
-                    break
-
-                sigma = _xkarsas_jit(
-                    f,
-                    1.0,
-                    n,
-                    n,
-                    freq_log_table,
-                    xn_log_table,
-                    xl_log_array,
-                    ekarsas_table,
-                    ln10,
-                )
+            # High-level terms (N=7-15) — use precomputed sigma
+            for i in range(n_ah):
+                sigma = sigma_high[i, k]
                 if sigma <= 0.0:
                     continue
-
+                coeff = high_level_terms[i, 2]
+                exponent = high_level_terms[i, 3]
                 contrib = sigma * coeff * np.exp(-exponent * hckt_j) * stim_j
                 h_val += contrib
                 s_val += contrib * bnu_j
 
-            # Low-level terms (N=2-6)
-            for i in range(n_low):
-                n = int(low_level_terms[i, 0])
-                threshold = low_level_terms[i, 1]
-                coeff = low_level_terms[i, 2]
-                exponent = low_level_terms[i, 3]
-
-                if wn < threshold:
-                    break
-
-                sigma = _xkarsas_jit(
-                    f,
-                    1.0,
-                    n,
-                    n,
-                    freq_log_table,
-                    xn_log_table,
-                    xl_log_array,
-                    ekarsas_table,
-                    ln10,
-                )
+            # Low-level terms (N=2-6) — use precomputed sigma
+            for i in range(n_al):
+                sigma = sigma_low[i, k]
                 if sigma <= 0.0:
                     continue
-
+                n = int(low_level_terms[i, 0])
+                coeff = low_level_terms[i, 2]
+                exponent = low_level_terms[i, 3]
                 bh = bhyd[j, n - 1]
                 delta = bh - eh
                 contrib = sigma * coeff * np.exp(-exponent * hckt_j) * delta
@@ -533,19 +587,9 @@ def _compute_hydrogen_continuum_kernel(
                 else:
                     s_val += contrib * bnu_j
 
-            # N=1 (Lyman limit)
-            if wn >= lyman_limit:
-                sigma = _xkarsas_jit(
-                    f,
-                    1.0,
-                    1,
-                    1,
-                    freq_log_table,
-                    xn_log_table,
-                    xl_log_array,
-                    ekarsas_table,
-                    ln10,
-                )
+            # N=1 (Lyman limit) — use precomputed sigma
+            if ly_active:
+                sigma = sigma_lyman[k]
                 if sigma > 0.0:
                     delta = bhyd[j, 0] - eh
                     contrib = sigma * 2.0 * delta
@@ -615,6 +659,24 @@ def compute_hydrogen_continuum(
     freq3 = HYDROGEN_CROSS_SECTION_COEFF / np.maximum(freq, 1e-30) ** 3
     waveno = freq / C_LIGHT_CM
 
+    # Precompute Karsas cross-sections (depth-independent) — eliminates
+    # redundant binary-search lookups inside the depth loop.
+    # Cost: nfreq × 15 calls (vs nfreq × layers × 15 previously).
+    sigma_high, sigma_low, sigma_lyman, n_active_high, n_active_low, lyman_active = (
+        _precompute_karsas_sigma(
+            freq,
+            waveno,
+            HIGH_LEVEL_TERMS_ARRAY,
+            LOW_LEVEL_TERMS_ARRAY,
+            LYMAN_LIMIT,
+            FREQ_LOG,
+            XN_LOG,
+            XL_LOG_ARRAY,
+            EKARSAS,
+            LN10,
+        )
+    )
+
     ahyd, shyd = _compute_hydrogen_continuum_kernel(
         freq,
         waveno,
@@ -632,11 +694,12 @@ def compute_hydrogen_continuum(
         RYDBERG_CM,
         LYMAN_LIMIT,
         BASE_LIMIT,
-        FREQ_LOG,
-        XN_LOG,
-        XL_LOG_ARRAY,
-        EKARSAS,
-        LN10,
+        sigma_high,
+        sigma_low,
+        sigma_lyman,
+        n_active_high,
+        n_active_low,
+        lyman_active,
     )
     logger.info("Hydrogen continuum computation complete")
     return ahyd, shyd

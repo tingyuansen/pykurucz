@@ -28,13 +28,71 @@ try:
 except ImportError:
     _NUMBA_AVAILABLE = False
 
-from .karsas_tables import xkarsas, xkarsas_grid
+from .karsas_tables import (
+    EKARSAS,
+    FREQ_LOG,
+    LN10,
+    XL_LOG_ARRAY,
+    XN_LOG,
+    xkarsas,
+    xkarsas_grid,
+)
+from .karsas_tables import _xkarsas_jit
 from .hydrogen_wings import compute_hydrogen_continuum
 from .hydrogen_profile import compute_xnh2 as _compute_xnh2_equilh2
 from .tcorr import rosstab_eval as _rosstab_eval, TcorrState as _TcorrState
 from .trace_runtime import trace_emit, trace_enabled, trace_in_focus
 
 logger = logging.getLogger(__name__)
+
+# Frequency-only xkarsas stacks reused across iterations (same ATLAS waveset).
+_HOP_CONT_H_CACHE: dict[tuple[int, float, float, float], np.ndarray] = {}
+_HE2_CONT_H_CACHE: dict[tuple[int, float, float, float], np.ndarray] = {}
+_HE1_XK_TRANS_CACHE: dict[tuple[int, float, float, float], dict[int, np.ndarray]] = {}
+
+
+def _freq_array_key(freq: np.ndarray) -> tuple[int, float, float, float]:
+    f = np.ascontiguousarray(freq, dtype=np.float64)
+    mid = int(f.size // 2)
+    return (int(f.size), float(f[0]), float(f[-1]), float(f[mid]))
+
+
+def _hop_cont_h_stack(freq: np.ndarray) -> np.ndarray:
+    """Stack HOP xkarsas grids for n=1..8; cached on frequency grid."""
+    key = _freq_array_key(freq)
+    cached = _HOP_CONT_H_CACHE.get(key)
+    if cached is not None and cached.shape[1] == freq.size:
+        return cached
+    cont_h = np.vstack([xkarsas_grid(freq, 1.0, n, n) for n in range(1, 9)])
+    _HOP_CONT_H_CACHE[key] = cont_h
+    return cont_h
+
+
+def _he2_cont_h_stack(freq: np.ndarray) -> np.ndarray:
+    """Stack HE2OP xkarsas grids for n=1..9; cached on frequency grid."""
+    key = _freq_array_key(freq)
+    cached = _HE2_CONT_H_CACHE.get(key)
+    if cached is not None and cached.shape[1] == freq.size:
+        return cached
+    cont_h = np.vstack([xkarsas_grid(freq, 4.0, n, n) for n in range(1, 10)])
+    _HE2_CONT_H_CACHE[key] = cont_h
+    return cont_h
+
+
+def _he1_xk_trans_grids(freq: np.ndarray) -> dict[int, np.ndarray]:
+    key = _freq_array_key(freq)
+    cached = _HE1_XK_TRANS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    grids = {
+        5: xkarsas_grid(freq, 1.236439, 3, 0),
+        6: xkarsas_grid(freq, 1.102898, 3, 0),
+        7: xkarsas_grid(freq, 1.045499, 3, 1),
+        8: xkarsas_grid(freq, 1.001427, 3, 2),
+        9: xkarsas_grid(freq, 0.9926, 3, 1),
+    }
+    _HE1_XK_TRANS_CACHE[key] = grids
+    return grids
 
 from .kapp_continuum_data import load_kapp_continuum_tables as _load_kc_tables
 
@@ -176,6 +234,11 @@ def _coulff_grid(nz: int, freqlg: np.ndarray, tlog: np.ndarray) -> np.ndarray:
     if nz < 1 or nz > 6:
         return np.ones((tlog.size, freqlg.size), dtype=np.float64)
 
+    freqlg_c = np.ascontiguousarray(freqlg, dtype=np.float64)
+    tlog_c = np.ascontiguousarray(tlog, dtype=np.float64)
+    if _NUMBA_AVAILABLE:
+        return _coulff_grid_nb(nz, freqlg_c, tlog_c, COULFF_A_TABLE, COULFF_Z4LOG)
+
     z4log = COULFF_Z4LOG[nz - 1]
     tlog_col = tlog[:, np.newaxis]
     freqlg_row = freqlg[np.newaxis, :]
@@ -203,6 +266,114 @@ def _coulff_grid(nz: int, freqlg: np.ndarray, tlog: np.ndarray) -> np.ndarray:
     return (1.0 - p) * ((1.0 - q) * a00 + q * a01) + p * (
         (1.0 - q) * a10 + q * a11
     )
+
+
+if _NUMBA_AVAILABLE:
+
+    @numba.njit(cache=True, parallel=True, nogil=True)
+    def _coulff_grid_nb(
+        nz: int,
+        freqlg: np.ndarray,
+        tlog: np.ndarray,
+        coulff_table: np.ndarray,
+        z4log_arr: np.ndarray,
+    ) -> np.ndarray:
+        """Numba COULFF bilinear lookup over (layer, frequency)."""
+        n_layers = tlog.size
+        nf = freqlg.size
+        out = np.empty((n_layers, nf), dtype=np.float64)
+        z4log = z4log_arr[nz - 1]
+        for j in numba.prange(n_layers):
+            tlog_j = tlog[j]
+            gamlog_base = 10.39638 - tlog_j / 1.15129 + z4log
+            for i in range(nf):
+                freqlg_i = freqlg[i]
+                gamlog = gamlog_base
+                hvktlg = (freqlg_i - tlog_j) / 1.15129 - 20.63764
+                igam = max(1, min(int(gamlog + 7.0), 10))
+                ihvkt = max(1, min(int(hvktlg + 9.0), 11))
+                p = gamlog - float(igam - 7)
+                q = hvktlg - float(ihvkt - 9)
+                ig = igam - 1
+                ih = ihvkt - 1
+                a00 = coulff_table[ih, ig]
+                a01 = coulff_table[ih + 1, ig]
+                a10 = coulff_table[ih, ig + 1]
+                a11 = coulff_table[ih + 1, ig + 1]
+                out[j, i] = (1.0 - p) * ((1.0 - q) * a00 + q * a01) + p * (
+                    (1.0 - q) * a10 + q * a11
+                )
+        return out
+
+
+if _NUMBA_AVAILABLE:
+    @numba.njit(cache=True, parallel=True, nogil=True)
+    def _hotop_boundfree_nb(
+        ahot_chunk: np.ndarray,
+        f_chunk: np.ndarray,
+        hotop_xnfp: np.ndarray,
+        exp_hot: np.ndarray,
+        freq0: np.ndarray,
+        xsect0: np.ndarray,
+        alpha0: np.ndarray,
+        power0: np.ndarray,
+        mult0: np.ndarray,
+        hot_id_idx: np.ndarray,
+    ) -> None:
+        """Add HOTOP bound-free transitions to ahot_chunk in-place."""
+        n_layers = ahot_chunk.shape[0]
+        nf = f_chunk.shape[0]
+        n_trans = freq0.shape[0]
+        for ti in range(n_trans):
+            f0 = freq0[ti]
+            xs0 = xsect0[ti]
+            a0 = alpha0[ti]
+            pw = int(power0[ti])
+            mult = mult0[ti]
+            hid = int(hot_id_idx[ti])
+            for j in numba.prange(n_layers):
+                pop = hotop_xnfp[j, hid]
+                eh = exp_hot[j, ti]
+                for i in range(nf):
+                    f = f_chunk[i]
+                    if f < f0:
+                        continue
+                    ratio = f0 / f
+                    xsect = xs0 * (a0 + ratio - a0 * ratio) * (ratio ** (0.5 * pw))
+                    xx = xsect * pop * mult
+                    threshold = ahot_chunk[j, i] * 0.01
+                    if xx > threshold:
+                        ahot_chunk[j, i] += xx * eh
+
+
+    @numba.njit(cache=True, parallel=True, nogil=True)
+    def _h2_collision_opacity_grid_nb(
+        result: np.ndarray,
+        active_idx: np.ndarray,
+        h2h2_nu: np.ndarray,
+        h2he_nu: np.ndarray,
+        it: np.ndarray,
+        delt: np.ndarray,
+        xnfhe1: np.ndarray,
+        xnh2: np.ndarray,
+        rho: np.ndarray,
+        stim: np.ndarray,
+    ) -> None:
+        n_layers = result.shape[0]
+        n_active = active_idx.size
+        for j in numba.prange(n_layers):
+            it_j = it[j]
+            delt_j = delt[j]
+            for ai in range(n_active):
+                fi = int(active_idx[ai])
+                xh2h2 = h2h2_nu[ai, it_j - 1] * delt_j + h2h2_nu[ai, it_j] * (1.0 - delt_j)
+                xh2he = h2he_nu[ai, it_j - 1] * delt_j + h2he_nu[ai, it_j] * (1.0 - delt_j)
+                result[j, fi] = (
+                    (10.0 ** xh2he * xnfhe1[j] + 10.0 ** xh2h2 * xnh2[j])
+                    * xnh2[j]
+                    / rho[j]
+                    * stim[j, fi]
+                )
 
 
 def _linter(xold: np.ndarray, yold: np.ndarray, xnew: np.ndarray) -> np.ndarray:
@@ -946,6 +1117,21 @@ def _h2_collision_opacity_grid(
     delt = np.clip((temp - 1000.0 * it) / 1000.0, 0.0, 1.0)
 
     active_idx = np.nonzero(active)[0]
+    if _NUMBA_AVAILABLE:
+        _h2_collision_opacity_grid_nb(
+            result,
+            active_idx,
+            h2h2_nu,
+            h2he_nu,
+            it,
+            delt,
+            xnfhe1,
+            xnh2,
+            rho,
+            stim,
+        )
+        return result
+
     for j in range(n_layers):
         xh2h2 = h2h2_nu[:, it[j] - 1] * delt[j] + h2h2_nu[:, it[j]] * (1.0 - delt[j])
         xh2he = h2he_nu[:, it[j] - 1] * delt[j] + h2he_nu[:, it[j]] * (1.0 - delt[j])
@@ -1290,6 +1476,501 @@ def _he12p3p(freq: float) -> float:
     return 10.0 ** x
 
 
+if _NUMBA_AVAILABLE:
+
+    @numba.njit(cache=True)
+    def _seaton_jit(
+        freq0: float, xsect: float, power: float, a: float, freq: float
+    ) -> float:
+        if freq < freq0:
+            return 0.0
+        ratio = freq0 / freq
+        return xsect * (a + (1.0 - a) * ratio) * np.sqrt(ratio ** int(2.0 * power + 0.01))
+
+    @numba.njit(cache=True)
+    def _crosshe_jit(
+        freq: float,
+        x505: np.ndarray,
+        x50: np.ndarray,
+        x20: np.ndarray,
+        x10: np.ndarray,
+    ) -> float:
+        if freq < 5.945209e15:
+            return 0.0
+        wave = 2.99792458e18 / freq
+        if wave > 50.0:
+            i = int(93.0 - (wave - 50.0) / 5.0)
+            i = min(92, max(2, i))
+            return (
+                (wave - (92 - i) * 5 - 50) / 5.0 * (x505[i - 2] - x505[i - 1]) + x505[i - 1]
+            ) * 1.0e-18
+        if wave > 20.0:
+            i = int(17.0 - (wave - 20.0) / 2.0)
+            i = min(16, max(2, i))
+            return (
+                (wave - (16 - i) * 2 - 20) / 2.0 * (x50[i - 2] - x50[i - 1]) + x50[i - 1]
+            ) * 1.0e-18
+        if wave > 10.0:
+            i = int(12.0 - (wave - 10.0) / 1.0)
+            i = min(11, max(2, i))
+            return (
+                (wave - (11 - i) * 1 - 10) / 1.0 * (x20[i - 2] - x20[i - 1]) + x20[i - 1]
+            ) * 1.0e-18
+        i = int(22.0 - wave / 0.5)
+        i = min(21, max(2, i))
+        return (
+            (wave - (21 - i) * 0.5) / 0.5 * (x10[i - 2] - x10[i - 1]) + x10[i - 1]
+        ) * 1.0e-18
+
+    @numba.njit(cache=True)
+    def _he12s3s_jit(freq: float, freq_tab: np.ndarray, x_tab: np.ndarray) -> float:
+        if freq < 38454.691 * 2.99792458e10:
+            return 0.0
+        if freq > 2.4 * 109722.267 * 2.99792458e10:
+            waveno = freq / 2.99792458e10
+            ek = (waveno - 38454.691) / 109722.267
+            eps = 2.0 * (ek - 2.47898) / 0.000780
+            return (
+                0.01521
+                * (470310.0 / waveno) ** 3.12
+                * 8.067e-18
+                * (eps - 122.4) ** 2
+                / (1.0 + eps ** 2)
+            )
+        freqlg = np.log10(freq)
+        idx = 15
+        for i in range(1, 16):
+            if freqlg > freq_tab[i]:
+                idx = i
+                break
+        x = (
+            (freqlg - freq_tab[idx])
+            / (freq_tab[idx - 1] - freq_tab[idx])
+            * (x_tab[idx - 1] - x_tab[idx])
+            + x_tab[idx]
+        )
+        return 10.0 ** x
+
+    @numba.njit(cache=True)
+    def _he12s1s_jit(freq: float, freq_tab: np.ndarray, x_tab: np.ndarray) -> float:
+        if freq < 32033.214 * 2.99792458e10:
+            return 0.0
+        if freq > 2.4 * 109722.267 * 2.99792458e10:
+            waveno = freq / 2.99792458e10
+            ek = (waveno - 32033.214) / 109722.267
+            eps = 2.0 * (ek - 2.612316) / 0.00322
+            return (
+                0.008175
+                * (484940.0 / waveno) ** 2.71
+                * 8.067e-18
+                * (eps + 76.21) ** 2
+                / (1.0 + eps ** 2)
+            )
+        freqlg = np.log10(freq)
+        idx = 15
+        for i in range(1, 16):
+            if freqlg > freq_tab[i]:
+                idx = i
+                break
+        x = (
+            (freqlg - freq_tab[idx])
+            / (freq_tab[idx - 1] - freq_tab[idx])
+            * (x_tab[idx - 1] - x_tab[idx])
+            + x_tab[idx]
+        )
+        return 10.0 ** x
+
+    @numba.njit(cache=True)
+    def _he12p1p_jit(freq: float, freq_tab: np.ndarray, x_tab: np.ndarray) -> float:
+        if freq < 27175.76 * 2.99792458e10:
+            return 0.0
+        if freq > 2.4 * 109722.267 * 2.99792458e10:
+            waveno = freq / 2.99792458e10
+            ek = (waveno - 27175.76) / 109722.267
+            eps1s = 2.0 * (ek - 2.446534) / 0.01037
+            eps1d = 2.0 * (ek - 2.59427) / 0.00538
+            return (
+                0.0009487
+                * (466750.0 / waveno) ** 3.69
+                * 8.067e-18
+                * (
+                    (eps1s - 29.30) ** 2 / (1.0 + eps1s ** 2)
+                    + (eps1d + 172.4) ** 2 / (1.0 + eps1d ** 2)
+                )
+            )
+        freqlg = np.log10(freq)
+        idx = 15
+        for i in range(1, 16):
+            if freqlg > freq_tab[i]:
+                idx = i
+                break
+        x = (
+            (freqlg - freq_tab[idx])
+            / (freq_tab[idx - 1] - freq_tab[idx])
+            * (x_tab[idx - 1] - x_tab[idx])
+            + x_tab[idx]
+        )
+        return 10.0 ** x
+
+    @numba.njit(cache=True)
+    def _he12p3p_jit(freq: float, freq_tab: np.ndarray, x_tab: np.ndarray) -> float:
+        if freq < 29223.753 * 2.99792458e10:
+            return 0.0
+        freqlg = np.log10(freq)
+        idx = 15
+        for i in range(1, 16):
+            if freqlg > freq_tab[i]:
+                idx = i
+                break
+        x = (
+            (freqlg - freq_tab[idx])
+            / (freq_tab[idx - 1] - freq_tab[idx])
+            * (x_tab[idx - 1] - x_tab[idx])
+            + x_tab[idx]
+        )
+        return 10.0 ** x
+
+    @numba.njit(cache=True, parallel=True, nogil=True)
+    def _fill_he1_trans_grid_nb(
+        freq: np.ndarray,
+        hefreq: np.ndarray,
+        trans_grid: np.ndarray,
+        crosshe_x505: np.ndarray,
+        crosshe_x50: np.ndarray,
+        crosshe_x20: np.ndarray,
+        crosshe_x10: np.ndarray,
+        he12s3s_freq: np.ndarray,
+        he12s3s_x: np.ndarray,
+        he12s1s_freq: np.ndarray,
+        he12s1s_x: np.ndarray,
+        he12p3p_freq: np.ndarray,
+        he12p3p_x: np.ndarray,
+        he12p1p_freq: np.ndarray,
+        he12p1p_x: np.ndarray,
+    ) -> None:
+        nfreq = freq.size
+        for j in numba.prange(nfreq):
+            f = freq[j]
+            if f >= hefreq[0]:
+                trans_grid[0, j] = _crosshe_jit(
+                    f, crosshe_x505, crosshe_x50, crosshe_x20, crosshe_x10
+                )
+            if f >= hefreq[1]:
+                trans_grid[1, j] = _he12s3s_jit(f, he12s3s_freq, he12s3s_x)
+            if f >= hefreq[2]:
+                trans_grid[2, j] = _he12s1s_jit(f, he12s1s_freq, he12s1s_x)
+            if f >= hefreq[3]:
+                trans_grid[3, j] = _he12p3p_jit(f, he12p3p_freq, he12p3p_x)
+            if f >= hefreq[4]:
+                trans_grid[4, j] = _he12p1p_jit(f, he12p1p_freq, he12p1p_x)
+
+    @numba.njit(cache=True, parallel=True, nogil=True)
+    def _hop_bolt_nb(
+        bolt: np.ndarray,
+        tkev: np.ndarray,
+        xnfph1: np.ndarray,
+        rho: np.ndarray,
+        bhyd: np.ndarray,
+    ) -> None:
+        """HOP Boltzmann factors for n=1..8 (atlas12.for lines 5268-5312)."""
+        n_layers = tkev.shape[0]
+        for j in numba.prange(n_layers):
+            tkev_j = tkev[j]
+            rho_j = rho[j]
+            xnf_j = xnfph1[j]
+            for n in range(8):
+                nn = n + 1
+                val = (
+                    np.exp(-(13.595 - 13.595 / float(nn * nn)) / tkev_j)
+                    * 2.0
+                    * float(nn * nn)
+                    * xnf_j
+                    / rho_j
+                )
+                if n < 6:
+                    val *= bhyd[j, n]
+                bolt[j, n] = val
+
+    @numba.njit(cache=True, parallel=True, nogil=True)
+    def _hop_bhyd_terms_nb(
+        h: np.ndarray,
+        s: np.ndarray,
+        cont_h: np.ndarray,
+        bolt: np.ndarray,
+        bhyd: np.ndarray,
+        ehvkt: np.ndarray,
+        bnu_all: np.ndarray,
+        stim: np.ndarray,
+    ) -> None:
+        """Add HOP bound-free terms for n=1..6 with BHYD source correction."""
+        n_layers = h.shape[0]
+        nfreq = h.shape[1]
+        for j in numba.prange(n_layers):
+            for n in range(6):
+                bh = bhyd[j, n]
+                if bh < 1.0e-300:
+                    bh = 1.0e-300
+                bolt_jn = bolt[j, n]
+                for i in range(nfreq):
+                    term = cont_h[n, i] * bolt_jn
+                    h[j, i] += term * (1.0 - ehvkt[j, i] / bh)
+                    s[j, i] += term * bnu_all[j, i] * stim[j, i] / bh
+
+    @numba.njit(cache=True, parallel=True, nogil=True)
+    def _hminop_fftheta_nb(
+        fftheta: np.ndarray,
+        fftt: np.ndarray,
+        theta: np.ndarray,
+        thetaff: np.ndarray,
+    ) -> None:
+        """Interpolate HMINOP FFTT over THETA for each layer."""
+        n_layers = theta.shape[0]
+        nthetaff = thetaff.shape[0]
+        nfreq = fftt.shape[1]
+        for layer_idx in numba.prange(n_layers):
+            th = theta[layer_idx]
+            iold = 1
+            for k in range(1, nthetaff):
+                if thetaff[k] > th:
+                    iold = k
+                    break
+            else:
+                iold = nthetaff - 1
+            if iold < 1:
+                iold = 1
+            denom = thetaff[iold] - thetaff[iold - 1]
+            if abs(denom) < 1.0e-40:
+                for i in range(nfreq):
+                    fftheta[layer_idx, i] = fftt[iold - 1, i]
+            else:
+                weight = (th - thetaff[iold - 1]) / denom
+                for i in range(nfreq):
+                    fftheta[layer_idx, i] = (
+                        fftt[iold - 1, i]
+                        + (fftt[iold, i] - fftt[iold - 1, i]) * weight
+                    )
+
+    @numba.njit(cache=True, parallel=True, nogil=True)
+    def _h2plop_active_nb(
+        ah2p: np.ndarray,
+        active_idx: np.ndarray,
+        es: np.ndarray,
+        fr: np.ndarray,
+        tkev: np.ndarray,
+        xnfph1: np.ndarray,
+        xnfph2: np.ndarray,
+        bhyd1: np.ndarray,
+        rho: np.ndarray,
+        stim: np.ndarray,
+    ) -> None:
+        """H2+ opacity on active frequency indices (atlas7v.for lines 5189-5211)."""
+        n_layers = tkev.shape[0]
+        n_active = active_idx.shape[0]
+        for j in numba.prange(n_layers):
+            tkev_j = tkev[j]
+            log_xnf1 = np.log(max(xnfph1[j], 1.0e-40))
+            pref = (
+                2.0
+                * bhyd1[j]
+                * xnfph2[j]
+                / rho[j]
+            )
+            for ai in range(n_active):
+                ia = active_idx[ai]
+                ah2p[j, ia] = (
+                    np.exp(-es[ai] / tkev_j + fr[ai] + log_xnf1)
+                    * pref
+                    * stim[j, ia]
+                )
+
+    @numba.njit(cache=True, parallel=True, nogil=True)
+    def _lukeop_aluke_nb(
+        aluke: np.ndarray,
+        freq: np.ndarray,
+        waveno: np.ndarray,
+        stim: np.ndarray,
+        ehvkt: np.ndarray,
+        hckt: np.ndarray,
+        tkev: np.ndarray,
+        rho: np.ndarray,
+        xnfpn: np.ndarray,
+        xnfpo: np.ndarray,
+        xnfpc2: np.ndarray,
+        xnfpmg2: np.ndarray,
+        xnfpsi2: np.ndarray,
+        xnfpca2: np.ndarray,
+        mg2_elev: np.ndarray,
+        mg2_zeff_num: np.ndarray,
+        mg2_n: np.ndarray,
+        mg2_l: np.ndarray,
+        mg2_bolt: np.ndarray,
+        mg2_exp2: np.ndarray,
+        mg2_kthresh: float,
+        mg2_elim: float,
+        mg2_ryd: float,
+        c2_elev: np.ndarray,
+        c2_bolt: np.ndarray,
+        c2_a: np.ndarray,
+        c2_b: np.ndarray,
+        c2_k1: float,
+        c2_k2: float,
+        c2_elim1: float,
+        c2_elim2: float,
+        c2_elim3: float,
+        c2_ryd: float,
+        c2_freq_factor: float,
+        si2_xtab: np.ndarray,
+        si2_it: np.ndarray,
+        si2_tfrac: np.ndarray,
+        si2_boltn: np.ndarray,
+        freq_log_table: np.ndarray,
+        xn_log_table: np.ndarray,
+        xl_log_array: np.ndarray,
+        ekarsas_table: np.ndarray,
+        ln10: float,
+    ) -> None:
+        n_layers = aluke.shape[0]
+        nfreq = freq.size
+        c_light = 2.99792458e10
+        mg2_z = 2.0
+        c2_z = 2.0
+        c2_n12 = np.array([5, 5, 5, 5, 5, 4, 4, 4, 4, 3, 3, 3], dtype=np.int64)
+        c2_l12 = np.array([4, 3, 2, 1, 0, 3, 2, 1, 0, 2, 1, 0], dtype=np.int64)
+        c2_znum12 = np.array([25.0, 25.0, 25.0, 25.0, 25.0, 16.0, 16.0, 16.0, 16.0, 9.0, 9.0, 9.0])
+        for j in numba.prange(nfreq):
+            f = freq[j]
+            wno_j = waveno[j]
+            x853 = 0.0
+            x1020 = 0.0
+            x1130 = 0.0
+            if f >= 3.517915e15:
+                x853 = _seaton_jit(3.517915e15, 1.142e-17, 2.0, 4.29, f)
+            if f >= 2.941534e15:
+                x1020 = _seaton_jit(2.941534e15, 4.41e-18, 1.5, 3.85, f)
+            if f >= 2.653317e15:
+                x1130 = _seaton_jit(2.653317e15, 4.2e-18, 1.5, 4.34, f)
+            x911 = 0.0
+            if f >= 3.28805e15:
+                x911 = _seaton_jit(3.28805e15, 2.94e-18, 1.0, 2.66, f)
+            x1044 = 0.0
+            x1218 = 0.0
+            x1420 = 0.0
+            if f >= 2.870454e15:
+                x1044 = 5.4e-20 * (2.870454e15 / f) ** 3
+            if f >= 2.460127e15:
+                x1218 = 1.64e-17 * np.sqrt(2.460127e15 / f)
+            if f >= 2.110779e15:
+                x1420 = _seaton_jit(2.110779e15, 4.13e-18, 3.0, 0.69, f)
+            mg2_freq3 = 2.815e29 / max(f * f * f, 1e-300) * mg2_z ** 4
+            c2_freq3 = c2_freq_factor / max(f * f * f, 1e-300)
+            si2_freq3 = 2.815e29 * 16.0 / max(f * f * f, 1e-300)
+            for k in range(n_layers):
+                stim_kj = stim[k, j]
+                inv_rho = stim_kj / rho[k]
+                c1130 = 6.0 * np.exp(-3.575 / tkev[k])
+                c1020 = 10.0 * np.exp(-2.384 / tkev[k])
+                n1op = x853 * 4.0 + x1020 * c1020 + x1130 * c1130
+                o1op = x911 * 9.0
+                c1218 = 10.0 * np.exp(-1.697 / tkev[k])
+                c1420 = 6.0 * np.exp(-3.142 / tkev[k])
+                ca2op = x1044 * 2.0 + x1218 * c1218 + x1420 * c1420
+                mg2_x = np.zeros(14, dtype=np.float64)
+                for i in range(13):
+                    if wno_j < mg2_elim - mg2_elev[i]:
+                        break
+                    zeff2 = mg2_zeff_num[i] / mg2_ryd * (mg2_elim - mg2_elev[i])
+                    mg2_x[i] = _xkarsas_jit(
+                        f, zeff2, mg2_n[i], mg2_l[i],
+                        freq_log_table, xn_log_table, xl_log_array, ekarsas_table, ln10,
+                    )
+                if wno_j >= mg2_elim - mg2_elev[13]:
+                    ratio = (mg2_elim - mg2_elev[13]) / max(wno_j, 1e-300)
+                    mg2_x[13] = 0.14e-18 * (6.700 * ratio ** 4 - 5.700 * ratio ** 5)
+                mg2_h = mg2_freq3 / (mg2_ryd * mg2_z ** 2 * hckt[k]) * (
+                    np.exp(-max(mg2_kthresh, mg2_elim - wno_j) * hckt[k]) - mg2_exp2[k]
+                )
+                mg2_dot = 0.0
+                for i in range(14):
+                    mg2_dot += mg2_x[i] * mg2_bolt[i, k]
+                mg2_h += mg2_dot
+                mg2op = mg2_h * xnfpmg2[k] * inv_rho
+                c2_x = np.zeros(34, dtype=np.float64)
+                for i in range(12):
+                    if wno_j < c2_elim1 - c2_elev[i]:
+                        break
+                    zeff2 = c2_znum12[i] / c2_ryd * (c2_elim1 - c2_elev[i])
+                    c2_x[i] = _xkarsas_jit(
+                        f, zeff2, c2_n12[i], c2_l12[i],
+                        freq_log_table, xn_log_table, xl_log_array, ekarsas_table, ln10,
+                    )
+                for i in range(13, 19):
+                    if wno_j < c2_elim2 - c2_elev[i]:
+                        break
+                    c2_x[i] = _xkarsas_jit(
+                        f, 9.0 / c2_ryd * (c2_elim2 - c2_elev[i]), 3, 2,
+                        freq_log_table, xn_log_table, xl_log_array, ekarsas_table, ln10,
+                    )
+                for i in range(19, 25):
+                    if wno_j < c2_elim2 - c2_elev[i]:
+                        break
+                    c2_x[i] = _xkarsas_jit(
+                        f, 9.0 / c2_ryd * (c2_elim2 - c2_elev[i]), 3, 1,
+                        freq_log_table, xn_log_table, xl_log_array, ekarsas_table, ln10,
+                    )
+                for i in range(25, 27):
+                    if wno_j < c2_elim2 - c2_elev[i]:
+                        break
+                    c2_x[i] = _xkarsas_jit(
+                        f, 9.0 / c2_ryd * (c2_elim2 - c2_elev[i]), 3, 0,
+                        freq_log_table, xn_log_table, xl_log_array, ekarsas_table, ln10,
+                    )
+                for i in range(31, 34):
+                    if wno_j < c2_elim3 - c2_elev[i]:
+                        break
+                    c2_x[i] = 3.0 * _xkarsas_jit(
+                        f, 4.0 / c2_ryd * (c2_elim3 - c2_elev[i]), 2, 1,
+                        freq_log_table, xn_log_table, xl_log_array, ekarsas_table, ln10,
+                    )
+                c2_h = c2_freq3 / (c2_ryd * c2_z ** 2 * hckt[k]) * (
+                    np.exp(-max(c2_k1, c2_elim1 - wno_j) * hckt[k]) - c2_a[k]
+                )
+                c2_h += c2_freq3 * 9.0 / (c2_ryd * c2_z ** 2 * hckt[k]) * (
+                    np.exp(-max(c2_k2, c2_elim2 - wno_j) * hckt[k]) - c2_b[k]
+                )
+                c2_dot = 0.0
+                for i in range(34):
+                    c2_dot += c2_x[i] * c2_bolt[i, k]
+                c2_h += c2_dot
+                c2op = c2_h * xnfpc2[k] * inv_rho
+                if wno_j >= 12192.48:
+                    iw = int(wno_j * 0.001)
+                    iw = max(min(iw, 199), 1)
+                    wfrac = (wno_j - iw * 1000.0) / 1000.0
+                    i0 = iw - 1
+                    i1 = iw
+                    it0 = si2_it[k] - 1
+                    it1 = si2_it[k]
+                    h00 = si2_xtab[i0, it0]
+                    h01 = si2_xtab[i0, it1]
+                    h10 = si2_xtab[i1, it0]
+                    h11 = si2_xtab[i1, it1]
+                    h0 = h00 * (1.0 - si2_tfrac[k]) + h01 * si2_tfrac[k]
+                    h1 = h10 * (1.0 - si2_tfrac[k]) + h11 * si2_tfrac[k]
+                    si2op = np.exp(h0 * (1.0 - wfrac) + h1 * wfrac) * xnfpsi2[k] * inv_rho
+                else:
+                    ehv = ehvkt[k, j]
+                    si2_h = si2_freq3 * (1.0 / max(ehv, 1e-300) - 1.0) * si2_boltn[k]
+                    si2op = si2_h * xnfpsi2[k] * inv_rho
+                aluke[k, j] = (
+                    n1op * xnfpn[k] * inv_rho
+                    + o1op * xnfpo[k] * inv_rho
+                    + ca2op * xnfpca2[k] * inv_rho
+                    + c2op
+                    + mg2op
+                    + si2op
+                )
+
+
 def compute_kapp_continuum(
     atmosphere: "AtmosphereModel",
     freq: np.ndarray,
@@ -1443,25 +2124,26 @@ def compute_kapp_continuum(
 
         tkev = np.maximum(temp * KBOLTZ_EV, 1e-300)
         bolt = np.zeros((n_layers, 8), dtype=np.float64)
-        for n in range(1, 9):
-            bolt[:, n - 1] = (
-                np.exp(-(13.595 - 13.595 / float(n * n)) / tkev)
-                * 2.0
-                * float(n * n)
-                * xnfph1
-                / rho
-            )
-            if n <= 6:
-                bolt[:, n - 1] *= bhyd[:, n - 1]
+        if _NUMBA_AVAILABLE:
+            _hop_bolt_nb(bolt, tkev, xnfph1, rho, bhyd)
+        else:
+            for n in range(1, 9):
+                bolt[:, n - 1] = (
+                    np.exp(-(13.595 - 13.595 / float(n * n)) / tkev)
+                    * 2.0
+                    * float(n * n)
+                    * xnfph1
+                    / rho
+                )
+                if n <= 6:
+                    bolt[:, n - 1] *= bhyd[:, n - 1]
         freet = xne * xnf_h_ionized / rho / np.sqrt(np.maximum(temp, 1e-300))
         xr = xnfph1 * (tkev / 13.595) / rho
         boltex = np.exp(-13.427 / tkev) * xr
         exlim = np.exp(-13.595 / tkev) * xr
         tlog_arr = np.log(np.maximum(temp, 1e-300))
         coulff_h = _coulff_grid(1, np.log(np.maximum(freq, 1e-300)), tlog_arr)
-        cont_h = np.vstack(
-            [xkarsas_grid(freq, 1.0, n, n) for n in range(1, 9)]
-        )
+        cont_h = _hop_cont_h_stack(freq)
 
         freq3 = np.maximum(freq * freq * freq, 1e-300)
         cfree = 3.6919e8 / freq3
@@ -1478,11 +2160,14 @@ def compute_kapp_continuum(
             + coulff_h * freet[:, np.newaxis] * cfree[np.newaxis, :]
         ) * stim
         s = h * bnu_all
-        for n in range(6):
-            bh = np.maximum(bhyd[:, n], 1e-300)
-            term = cont_h[n, :][np.newaxis, :] * bolt[:, n][:, np.newaxis]
-            h = h + term * (1.0 - ehvkt / bh[:, np.newaxis])
-            s = s + term * bnu_all * stim / bh[:, np.newaxis]
+        if _NUMBA_AVAILABLE:
+            _hop_bhyd_terms_nb(h, s, cont_h, bolt, bhyd, ehvkt, bnu_all, stim)
+        else:
+            for n in range(6):
+                bh = np.maximum(bhyd[:, n], 1e-300)
+                term = cont_h[n, :][np.newaxis, :] * bolt[:, n][:, np.newaxis]
+                h = h + term * (1.0 - ehvkt / bh[:, np.newaxis])
+                s = s + term * bnu_all * stim / bh[:, np.newaxis]
         ahyd[:, :] = h
         shyd[:, :] = np.where(h > 0.0, s / np.maximum(h, 1e-300), bnu_all)
 
@@ -1531,18 +2216,33 @@ def compute_kapp_continuum(
                     if bhyd.shape[1] > 0
                     else np.ones(n_layers, dtype=np.float64)
                 )
-                ah2p[:, active] = (
-                    np.exp(
-                        -es[np.newaxis, :] / tkev[:, np.newaxis]
-                        + fr[np.newaxis, :]
-                        + np.log(np.maximum(xnfph1, 1e-40))[:, np.newaxis]
+                if _NUMBA_AVAILABLE:
+                    active_idx = np.flatnonzero(active).astype(np.int64)
+                    _h2plop_active_nb(
+                        ah2p,
+                        active_idx,
+                        es,
+                        fr,
+                        tkev,
+                        xnfph1,
+                        xnfph2,
+                        bhyd1,
+                        rho,
+                        stim,
                     )
-                    * 2.0
-                    * bhyd1[:, np.newaxis]
-                    * xnfph2[:, np.newaxis]
-                    / rho[:, np.newaxis]
-                    * stim[:, active]
-                )
+                else:
+                    ah2p[:, active] = (
+                        np.exp(
+                            -es[np.newaxis, :] / tkev[:, np.newaxis]
+                            + fr[np.newaxis, :]
+                            + np.log(np.maximum(xnfph1, 1e-40))[:, np.newaxis]
+                        )
+                        * 2.0
+                        * bhyd1[:, np.newaxis]
+                        * xnfph2[:, np.newaxis]
+                        / rho[:, np.newaxis]
+                        * stim[:, active]
+                    )
 
     # HE1OP: Helium I opacity (atlas12.for lines 6007-6127)
     if ifop[4] == 1 and atmosphere.xnf_he1 is not None:
@@ -1600,13 +2300,7 @@ def compute_kapp_continuum(
 
         he1_tlog = np.log(np.maximum(temp, 1e-10))
         he1_coulff = _coulff_grid(1, np.log(np.maximum(freq, 1e-300)), he1_tlog)
-        he1_xk_trans = {
-            5: xkarsas_grid(freq, 1.236439, 3, 0),
-            6: xkarsas_grid(freq, 1.102898, 3, 0),
-            7: xkarsas_grid(freq, 1.045499, 3, 1),
-            8: xkarsas_grid(freq, 1.001427, 3, 2),
-            9: xkarsas_grid(freq, 0.9926, 3, 1),
-        }
+        he1_xk_trans = _he1_xk_trans_grids(freq)
         he1_auto_grids: dict[float, np.ndarray] = {}
         for elim, levels in (
             (527490.06, (171135.000, 169087.0, 166277.546, 159856.069)),
@@ -1619,105 +2313,111 @@ def compute_kapp_continuum(
         for _n in range(4, 28):
             he1_transn[_n, :] = xkarsas_grid(freq, 4.0 - 3.0 / (_n * _n), 1, 0)
 
-        for j in range(nfreq):
-            f = freq[j]
-            stim_j = stim[:, j]
-            ehvkt_j = ehvkt[:, j]
+        # Vectorized HE1OP: eliminate per-frequency Python loop
+        freq3_he1 = freq ** 3
+        cfree_he1 = 3.6919e8 / freq3_he1       # (nfreq,)
+        c_const_he1 = 2.815e29 / freq3_he1      # (nfreq,)
 
-            freq3 = f ** 3
-            cfree = 3.6919e8 / freq3
-            c_const = 2.815e29 / freq3
+        # Build trans_grid[10, nfreq] — cross-section for each level across all freqs
+        # imin[j] = first level n (1-based) where _he1_hefreq[n-1] <= freq[j], else 0
+        # Level n is active at freq j if imin[j] >= 1 and imin[j] <= n+1
+        # Equivalently: freq[j] >= _he1_hefreq[n]  (since hefreq is sorted descending)
+        trans_grid = np.zeros((10, nfreq), dtype=np.float64)
 
-            # Find IMIN: first level with ionization freq <= current freq
-            # (atlas12.for lines 6045-6049)
-            imin = 0
-            for _n in range(10):
-                if _he1_hefreq[_n] <= f:
-                    imin = _n + 1  # Fortran 1-based
-                    break
+        if _NUMBA_AVAILABLE:
+            _fill_he1_trans_grid_nb(
+                np.ascontiguousarray(freq, dtype=np.float64),
+                np.ascontiguousarray(_he1_hefreq, dtype=np.float64),
+                trans_grid,
+                _CROSSHE_X505,
+                _CROSSHE_X50,
+                _CROSSHE_X20,
+                _CROSSHE_X10,
+                _HE12S3S_FREQ,
+                _HE12S3S_X,
+                _HE12S1S_FREQ,
+                _HE12S1S_X,
+                _HE12P3P_FREQ,
+                _HE12P3P_X,
+                _HE12P1P_FREQ,
+                _HE12P1P_X,
+            )
+        else:
+            # Level 0: _crosshe — active where freq >= _he1_hefreq[0]
+            m0 = freq >= _he1_hefreq[0]
+            if np.any(m0):
+                trans_grid[0, m0] = np.array([_crosshe(f) for f in freq[m0]])
+            # Level 1: _he12s3s
+            m1 = freq >= _he1_hefreq[1]
+            if np.any(m1):
+                trans_grid[1, m1] = np.array([_he12s3s(f) for f in freq[m1]])
+            # Level 2: _he12s1s
+            m2 = freq >= _he1_hefreq[2]
+            if np.any(m2):
+                trans_grid[2, m2] = np.array([_he12s1s(f) for f in freq[m2]])
+            # Level 3: _he12p3p
+            m3 = freq >= _he1_hefreq[3]
+            if np.any(m3):
+                trans_grid[3, m3] = np.array([_he12p3p(f) for f in freq[m3]])
+            # Level 4: _he12p1p
+            m4 = freq >= _he1_hefreq[4]
+            if np.any(m4):
+                trans_grid[4, m4] = np.array([_he12p1p(f) for f in freq[m4]])
+        # Levels 5-9: from precomputed xkarsas_grid
+        for _n in range(5, 10):
+            mn = freq >= _he1_hefreq[_n]
+            if np.any(mn):
+                trans_grid[_n, mn] = he1_xk_trans[_n][mn]
 
-            # Cross-sections TRANS[0..9] via fall-through (atlas12.for 6050-6065)
-            trans = np.zeros(10, dtype=np.float64)
-            if imin >= 1:
-                if imin <= 1:
-                    trans[0] = _crosshe(f)
-                if imin <= 2:
-                    trans[1] = _he12s3s(f)
-                if imin <= 3:
-                    trans[2] = _he12s1s(f)
-                if imin <= 4:
-                    trans[3] = _he12p3p(f)
-                if imin <= 5:
-                    trans[4] = _he12p1p(f)
-                if imin <= 6:
-                    trans[5] = he1_xk_trans[5][j]
-                if imin <= 7:
-                    trans[6] = he1_xk_trans[6][j]
-                if imin <= 8:
-                    trans[7] = he1_xk_trans[7][j]
-                if imin <= 9:
-                    trans[8] = he1_xk_trans[8][j]
-                if imin <= 10:
-                    trans[9] = he1_xk_trans[9][j]
+        # Autoionization: He II n=2 (atlas12.for lines 6067-6084)
+        # Nested thresholds — each adds to a specific level
+        _auto_n2 = [(171135.000, 4), (169087.0, 3), (166277.546, 2), (159856.069, 1)]
+        elim2_he1 = 527490.06
+        for level_cm, trans_idx in _auto_n2:
+            freqhe = (elim2_he1 - level_cm) * C_LIGHT_CM
+            mask = freq >= freqhe
+            if np.any(mask):
+                trans_grid[trans_idx, mask] += he1_auto_grids[freqhe][mask]
 
-                # He II n=2 autoionization (atlas12.for lines 6067-6084)
-                elim2 = 527490.06
-                freqhe = (elim2 - 171135.000) * C_LIGHT_CM
-                if f >= freqhe:
-                    trans[4] += he1_auto_grids[freqhe][j]
-                    freqhe = (elim2 - 169087.0) * C_LIGHT_CM
-                    if f >= freqhe:
-                        trans[3] += he1_auto_grids[freqhe][j]
-                        freqhe = (elim2 - 166277.546) * C_LIGHT_CM
-                        if f >= freqhe:
-                            trans[2] += he1_auto_grids[freqhe][j]
-                            freqhe = (elim2 - 159856.069) * C_LIGHT_CM
-                            if f >= freqhe:
-                                trans[1] += he1_auto_grids[freqhe][j]
+        # Autoionization: He II n=3 (atlas12.for lines 6086-6106)
+        _auto_n3 = [(186209.471, 9), (186101.0, 8), (185564.0, 7), (184864.0, 6), (183236.0, 5)]
+        elim3_he1 = 588451.59
+        for level_cm, trans_idx in _auto_n3:
+            freqhe = (elim3_he1 - level_cm) * C_LIGHT_CM
+            mask = freq >= freqhe
+            if np.any(mask):
+                trans_grid[trans_idx, mask] += he1_auto_grids[freqhe][mask]
 
-                # He II n=3 autoionization (atlas12.for lines 6086-6106)
-                elim3 = 588451.59
-                freqhe = (elim3 - 186209.471) * C_LIGHT_CM
-                if f >= freqhe:
-                    trans[9] += he1_auto_grids[freqhe][j]
-                    freqhe = (elim3 - 186101.0) * C_LIGHT_CM
-                    if f >= freqhe:
-                        trans[8] += he1_auto_grids[freqhe][j]
-                        freqhe = (elim3 - 185564.0) * C_LIGHT_CM
-                        if f >= freqhe:
-                            trans[7] += he1_auto_grids[freqhe][j]
-                            freqhe = (elim3 - 184864.0) * C_LIGHT_CM
-                            if f >= freqhe:
-                                trans[6] += he1_auto_grids[freqhe][j]
-                                freqhe = (elim3 - 183236.0) * C_LIGHT_CM
-                                if f >= freqhe:
-                                    trans[5] += he1_auto_grids[freqhe][j]
+        # Build active mask for each level: level n is active where freq >= _he1_hefreq[n]
+        # The Fortran logic finds imin (first active level) and then includes all levels >= imin.
+        # This is equivalent to: for each level n, include it if freq >= _he1_hefreq[n].
+        # Apply mask: zero out trans_grid where level is not active
+        # (Already done above — each trans_grid[n] is only filled where freq >= hefreq[n])
 
-            # High-n levels N=4..27 (atlas12.for lines 6107-6110)
-            transn = np.zeros(28, dtype=np.float64)
-            if f >= 1.25408e16:
-                for _n in range(4, 28):
-                    transn[_n] = he1_transn[_n, j]
+        # he1_bolt (n_layers, 10) @ trans_grid (10, nfreq) → (n_layers, nfreq)
+        bound_contribution = he1_bolt @ trans_grid
 
-            # Per-layer computation (atlas12.for lines 6111-6123)
-            if f < 2.055e14:
-                ex = he1_exlim / ehvkt_j
-            else:
-                ex = he1_boltex.copy()
-            he1_val = (ex - he1_exlim) * c_const
+        # High-n levels N=4..27: active where freq >= 1.25408e16
+        high_n_mask = freq >= 1.25408e16
+        if np.any(high_n_mask):
+            # he1_boltn (n_layers, 28) @ he1_transn (28, nfreq) → (n_layers, nfreq)
+            # Only high-n rows 4..27 are nonzero
+            bound_contribution[:, high_n_mask] += (he1_boltn @ he1_transn)[:, high_n_mask]
 
-            if imin >= 1:
-                for _n in range(imin - 1, 10):
-                    he1_val = he1_val + trans[_n] * he1_bolt[:, _n]
+        # ex selection
+        ex_he1 = np.empty((n_layers, nfreq), dtype=np.float64)
+        low_he1 = freq < 2.055e14
+        if np.any(low_he1):
+            ex_he1[:, low_he1] = he1_exlim[:, np.newaxis] / ehvkt[:, low_he1]
+        if np.any(~low_he1):
+            ex_he1[:, ~low_he1] = he1_boltex[:, np.newaxis]
 
-            if f >= 1.25408e16:
-                for _n in range(4, 28):
-                    he1_val = he1_val + transn[_n] * he1_boltn[:, _n]
+        he1_val_all = (ex_he1 - he1_exlim[:, np.newaxis]) * c_const_he1[np.newaxis, :]
+        he1_val_all += bound_contribution
+        he1_val_all += he1_coulff * cfree_he1[np.newaxis, :] * he1_freet[:, np.newaxis]
 
-            # Free-free: COULFF(J,1)*FREET(J)*CFREE (atlas12.for line 6123)
-            coulff_arr = he1_coulff[:, j]
-            ahe1[:, j] = (he1_val + coulff_arr * he1_freet * cfree) * stim_j
-            she1[:, j] = bnu_all[:, j]
+        ahe1[:, :] = he1_val_all * stim
+        she1[:, :] = bnu_all
 
     # HE2OP: Helium II opacity (atlas12.for lines 6331-6375)
     # Uses XKARSAS (Karzas & Latter 1960) cross-sections, matching atlas12 exactly.
@@ -1747,32 +2447,30 @@ def compute_kapp_continuum(
 
         tlog_arr = np.log(np.maximum(temp, 1e-10))
         he2_coulff = _coulff_grid(2, np.log(np.maximum(freq, 1e-300)), tlog_arr)
-        he2_cont = np.vstack(
-            [xkarsas_grid(freq, 4.0, n, n) for n in range(1, 10)]
-        )
+        he2_cont = _he2_cont_h_stack(freq)
 
-        for j in range(nfreq):
-            f = freq[j]
+        # Vectorized HE2OP: eliminate per-frequency Python loop
+        freq3_all = freq ** 3                                   # (nfreq,)
+        cfree_all = 3.6919e8 / freq3_all * 4.0                 # (nfreq,)
+        c_const_all = 2.815e29 * 4.0 / freq3_all               # (nfreq,)
 
-            cont = he2_cont[:, j]
+        # ex selection: low-freq branch vs high-freq branch
+        low_mask = freq < 1.31522e14                            # (nfreq,)
+        ex_all = np.empty((n_layers, nfreq), dtype=np.float64)
+        if np.any(low_mask):
+            ex_all[:, low_mask] = exlim[:, np.newaxis] / ehvkt[:, low_mask]
+        if np.any(~low_mask):
+            ex_all[:, ~low_mask] = boltex[:, np.newaxis]
 
-            freq3 = f ** 3
-            cfree = 3.6919e8 / freq3 * 4.0
-            c_const = 2.815e29 * 4.0 / freq3
+        # he2_val = (ex - exlim) * c_const + sum_n(cont[n] * bolt[:, n])
+        he2_val = (ex_all - exlim[:, np.newaxis]) * c_const_all[np.newaxis, :]
 
-            if f < 1.31522e14:
-                ex = exlim / ehvkt[:, j]
-            else:
-                ex = boltex
-            he2_val = (ex - exlim) * c_const
+        # bolt (n_layers, 9) @ he2_cont (9, nfreq) → (n_layers, nfreq)
+        he2_val += bolt @ he2_cont
 
-            for n in range(9):
-                he2_val = he2_val + cont[n] * bolt[:, n]
-
-            coulff_arr = he2_coulff[:, j]
-
-            ahe2[:, j] = (he2_val + coulff_arr * cfree * freet) * stim[:, j]
-            she2[:, j] = bnu_all[:, j]
+        # Add free-free: coulff * cfree * freet
+        ahe2[:, :] = (he2_val + he2_coulff * cfree_all[np.newaxis, :] * freet[:, np.newaxis]) * stim
+        she2[:, :] = bnu_all
 
     # HEMIOP: He- opacity (atlas7v.for line 7296-7318)
     # Fortran evidence:
@@ -1870,15 +2568,23 @@ def compute_kapp_continuum(
         # Interpolate FFTT over THETA for each layer.  The theta bracket is
         # layer-only, so reuse it across the full frequency grid.
         fftheta = np.empty((n_layers, nfreq), dtype=np.float64)
-        for layer_idx in range(n_layers):
-            iold = int(np.searchsorted(HMINOP_THETAFF, theta[layer_idx], side="right"))
-            iold = max(1, min(iold, nthetaff - 1))
-            denom = HMINOP_THETAFF[iold] - HMINOP_THETAFF[iold - 1]
-            if abs(denom) < 1e-40:
-                fftheta[layer_idx, :] = fftt[iold - 1, :]
-            else:
-                weight = (theta[layer_idx] - HMINOP_THETAFF[iold - 1]) / denom
-                fftheta[layer_idx, :] = fftt[iold - 1, :] + (fftt[iold, :] - fftt[iold - 1, :]) * weight
+        if _NUMBA_AVAILABLE:
+            _hminop_fftheta_nb(
+                fftheta,
+                fftt,
+                theta,
+                np.asarray(HMINOP_THETAFF, dtype=np.float64),
+            )
+        else:
+            for layer_idx in range(n_layers):
+                iold = int(np.searchsorted(HMINOP_THETAFF, theta[layer_idx], side="right"))
+                iold = max(1, min(iold, nthetaff - 1))
+                denom = HMINOP_THETAFF[iold] - HMINOP_THETAFF[iold - 1]
+                if abs(denom) < 1e-40:
+                    fftheta[layer_idx, :] = fftt[iold - 1, :]
+                else:
+                    weight = (theta[layer_idx] - HMINOP_THETAFF[iold - 1]) / denom
+                    fftheta[layer_idx, :] = fftt[iold - 1, :] + (fftt[iold, :] - fftt[iold - 1, :]) * weight
 
         # HMINBF from MAP1 (atlas7v.for line 5306)
         hminbf = np.zeros(nfreq, dtype=np.float64)
@@ -2032,106 +2738,88 @@ def compute_kapp_continuum(
         # hckt is shape (n_layers,) — from atmosphere
         bolt = _c1_glev[:, None] * np.exp(-_c1_elev[:, None] * hckt[None, :])
 
-        for j in range(nfreq):
-            f = freq[j]
-            wno = waveno[j]
-            stim_j = stim[:, j]
-
-            # Fortran: IF(FREQ.GT.3.28805D15)RETURN  (Lyman limit guard)
-            if f > 3.28805e15:
-                continue
-
+        # Vectorized C1OP: eliminate per-frequency Python loop
+        lyman_mask = freq <= 3.28805e15  # (nfreq,)
+        if np.any(lyman_mask):
             z = 1.0
-            freq3 = 2.815e29 / f / f / f * z**4
+            _c1_elim1 = 90862.70
+            _c1_elim2 = 90820.42
+            _c1_elim2b = _c1_elim2 + 63.42
+            _c1_elim3 = _c1_elim2 + 43003.3
+            _c1_elim_ff = _c1_elim2
 
-            # Compute cross-sections x[0..24]
-            x = np.zeros(25)
+            # x_grid[25, nfreq] — cross-section per level per frequency
+            x_grid = np.zeros((25, nfreq), dtype=np.float64)
 
-            # --- Group 1: C II 2P average limit (levels 1-14) ---
-            elim1 = 90862.70
-            # Levels 1-6: 2s2 2p3d states, XKARSAS(FREQ, ZEFF2, 3, 2)
-            for i in range(6):
-                if wno < elim1 - _c1_elev[i]:
-                    break
-                zeff2 = 9.0 / _RYD * (elim1 - _c1_elev[i])
-                x[i] = xkarsas(f, zeff2, 3, 2)
-            # Levels 7-12: 2s2 2p3p states, XKARSAS(FREQ, ZEFF2, 3, 1)
-            for i in range(6, 12):
-                if wno < elim1 - _c1_elev[i]:
-                    break
-                zeff2 = 9.0 / _RYD * (elim1 - _c1_elev[i])
-                x[i] = xkarsas(f, zeff2, 3, 1)
-            # Levels 13-14: 2s2 2p3s states, XKARSAS(FREQ, ZEFF2, 3, 0)
-            for i in range(12, 14):
-                if wno < elim1 - _c1_elev[i]:
-                    break
-                zeff2 = 9.0 / _RYD * (elim1 - _c1_elev[i])
-                x[i] = xkarsas(f, zeff2, 3, 0)
+            # Group 1: levels 0-5 (n=3, l=2), 6-11 (n=3, l=1), 12-13 (n=3, l=0)
+            for i in range(14):
+                thresh = _c1_elim1 - _c1_elev[i]
+                mask = lyman_mask & (waveno >= thresh)
+                if not np.any(mask):
+                    continue
+                zeff2 = 9.0 / _RYD * thresh
+                if i < 6:
+                    x_grid[i, mask] = xkarsas_grid(freq[mask], zeff2, 3, 2)
+                elif i < 12:
+                    x_grid[i, mask] = xkarsas_grid(freq[mask], zeff2, 3, 1)
+                else:
+                    x_grid[i, mask] = xkarsas_grid(freq[mask], zeff2, 3, 0)
 
-            # --- Group 2: C II 2P1/2 limit (levels 15-19), Luo & Pradhan ---
-            elim2 = 90820.42
-            # Level 15 (1S): Luo & Pradhan + Burke & Taylor resonance
-            if wno >= elim2 - _c1_elev[14]:
-                xs0 = 10.0 ** (-16.80 - (wno - elim2 + _c1_elev[14]) / 3.0 / _RYD)
-                eps = (wno - 97700.0) * 2.0 / 2743.0
-                xs1 = (68e-18 * eps + 118e-18) / (eps**2 + 1.0)
-                x[14] = (xs0 + xs1) * 1.0 / 3.0
-            # Level 16 (1D): Luo & Pradhan + two Burke & Taylor resonances
-            if wno >= elim2 - _c1_elev[15]:
-                xd0 = 10.0 ** (-16.80 - (wno - elim2 + _c1_elev[15]) / 3.0 / _RYD)
-                eps1 = (wno - 93917.0) * 2.0 / 9230.0
-                xd1 = (22e-18 * eps1 + 26e-18) / (eps1**2 + 1.0)
-                eps2 = (wno - 111130.0) * 2.0 / 2743.0
-                xd2 = (-10.5e-18 * eps2 + 46e-18) / (eps2**2 + 1.0)
-                x[15] = (xd0 + xd1 + xd2) * 1.0 / 3.0
-            # Levels 17-19 (3P2, 3P1, 3P0): Luo & Pradhan
-            for i in range(16, 19):
-                if wno >= elim2 - _c1_elev[i]:
-                    x[i] = 10.0 ** (-16.80 - (wno - elim2 + _c1_elev[i]) / 3.0 / _RYD) * 1.0 / 3.0
+            # Group 2: Luo & Pradhan levels 14-18, C II 2P1/2 limit (1/3 weight)
+            for elim_g2, weight in [(_c1_elim2, 1.0 / 3.0), (_c1_elim2b, 2.0 / 3.0)]:
+                # Level 14 (1S)
+                mask14 = lyman_mask & (waveno >= elim_g2 - _c1_elev[14])
+                if np.any(mask14):
+                    wno_m = waveno[mask14]
+                    xs0 = 10.0 ** (-16.80 - (wno_m - elim_g2 + _c1_elev[14]) / 3.0 / _RYD)
+                    eps = (wno_m - 97700.0) * 2.0 / 2743.0
+                    xs1 = (68e-18 * eps + 118e-18) / (eps**2 + 1.0)
+                    x_grid[14, mask14] += (xs0 + xs1) * weight
+                # Level 15 (1D)
+                mask15 = lyman_mask & (waveno >= elim_g2 - _c1_elev[15])
+                if np.any(mask15):
+                    wno_m = waveno[mask15]
+                    xd0 = 10.0 ** (-16.80 - (wno_m - elim_g2 + _c1_elev[15]) / 3.0 / _RYD)
+                    eps1 = (wno_m - 93917.0) * 2.0 / 9230.0
+                    xd1 = (22e-18 * eps1 + 26e-18) / (eps1**2 + 1.0)
+                    eps2 = (wno_m - 111130.0) * 2.0 / 2743.0
+                    xd2 = (-10.5e-18 * eps2 + 46e-18) / (eps2**2 + 1.0)
+                    x_grid[15, mask15] += (xd0 + xd1 + xd2) * weight
+                # Levels 16-18 (3P)
+                for i in range(16, 19):
+                    mask_i = lyman_mask & (waveno >= elim_g2 - _c1_elev[i])
+                    if np.any(mask_i):
+                        x_grid[i, mask_i] += (
+                            10.0 ** (-16.80 - (waveno[mask_i] - elim_g2 + _c1_elev[i]) / 3.0 / _RYD) * weight
+                        )
 
-            # --- Group 2b: C II 2P3/2 limit (levels 15-19), 2/3 weight added ---
-            elim2b = 90820.42 + 63.42
-            if wno >= elim2b - _c1_elev[14]:
-                xs0 = 10.0 ** (-16.80 - (wno - elim2b + _c1_elev[14]) / 3.0 / _RYD)
-                eps = (wno - 97700.0) * 2.0 / 2743.0
-                xs1 = (68e-18 * eps + 118e-18) / (eps**2 + 1.0)
-                x[14] += (xs0 + xs1) * 2.0 / 3.0
-            if wno >= elim2b - _c1_elev[15]:
-                xd0 = 10.0 ** (-16.80 - (wno - elim2b + _c1_elev[15]) / 3.0 / _RYD)
-                eps1 = (wno - 93917.0) * 2.0 / 9230.0
-                xd1 = (22e-18 * eps1 + 26e-18) / (eps1**2 + 1.0)
-                eps2 = (wno - 111130.0) * 2.0 / 2743.0
-                xd2 = (-10.5e-18 * eps2 + 46e-18) / (eps2**2 + 1.0)
-                x[15] += (xd0 + xd1 + xd2) * 2.0 / 3.0
-            for i in range(16, 19):
-                if wno >= elim2b - _c1_elev[i]:
-                    x[i] += 10.0 ** (-16.80 - (wno - elim2b + _c1_elev[i]) / 3.0 / _RYD) * 2.0 / 3.0
-
-            # --- Group 3: C II 4P1/2 limit (levels 20-25) ---
-            elim3 = 90820.42 + 43003.3
+            # Group 3: levels 19-24 (n=2, l=1, degen=3)
             degen = 3.0
             for i in range(19, 25):
-                if wno < elim3 - _c1_elev[i]:
-                    break
-                zeff2 = 4.0 / _RYD * (elim3 - _c1_elev[i])
-                x[i] = xkarsas(f, zeff2, 2, 1) * degen
+                thresh = _c1_elim3 - _c1_elev[i]
+                mask = lyman_mask & (waveno >= thresh)
+                if not np.any(mask):
+                    continue
+                zeff2 = 4.0 / _RYD * thresh
+                x_grid[i, mask] = xkarsas_grid(freq[mask], zeff2, 2, 1) * degen
 
-            # --- Kramers-Gaunt n>=4 free-free approximation ---
-            elim_ff = 90820.42
+            # Kramers-Gaunt n>=4 free-free
             gfactor = 6.0
             ryd_z2_over_16 = _RYD * z**2 / 16.0
-            kramers_exp_arg_min = max(elim_ff - ryd_z2_over_16, elim_ff - wno)
-            # h_kramers[k] = freq3*gfactor*2/2/(RYD*Z^2*HCKT(k)) * (exp(-...) - exp(-elim*HCKT(k)))
-            h_kramers = (freq3 * gfactor / (_RYD * z**2 * hckt)
-                         * (np.exp(-kramers_exp_arg_min * hckt)
-                            - np.exp(-elim_ff * hckt)))
+            freq3_all = 2.815e29 * z**4 / (freq ** 3)  # (nfreq,)
+            kramers_exp_arg_min = np.maximum(_c1_elim_ff - ryd_z2_over_16, _c1_elim_ff - waveno)  # (nfreq,)
+            # h_kramers: (n_layers, nfreq)
+            h_kramers_all = (
+                freq3_all[np.newaxis, :] * gfactor / (_RYD * z**2 * hckt[:, np.newaxis])
+                * (np.exp(-kramers_exp_arg_min[np.newaxis, :] * hckt[:, np.newaxis])
+                   - np.exp(-_c1_elim_ff * hckt)[:, np.newaxis])
+            )
 
-            # Sum: H = kramers + sum(x[i] * bolt[i, :])
-            h = h_kramers + np.dot(x, bolt)
+            # Sum: H = kramers + bolt.T @ x_grid  → bolt is (25, n_layers), x_grid is (25, nfreq)
+            h_all = h_kramers_all + bolt.T @ x_grid  # (n_layers, nfreq)
 
-            # Final: AC1(J) = H * XNFP(J,21) * STIM(J) / RHO(J)
-            ac1[:, j] = h * xnfpc * stim_j / rho
-            sc1[:, j] = bnu_all[:, j]
+            ac1[:, lyman_mask] = h_all[:, lyman_mask] * (xnfpc * stim[:, lyman_mask].T / rho).T
+            sc1[:, lyman_mask] = bnu_all[:, lyman_mask]
 
     # MG1OP: Magnesium I opacity — atlas12.for lines 6768-6896.
     # Fortran: XNFP(J,78), 1-based → Python index 77.
@@ -2150,74 +2838,78 @@ def compute_kapp_continuum(
 
         bolt_mg = _mg1_glev[:, None] * np.exp(-_mg1_elev[:, None] * hckt[None, :])
 
-        for j in range(nfreq):
-            f = freq[j]
-            wno = waveno[j]
-            stim_j = stim[:, j]
-
-            if f > 3.28805e15:
-                continue
-
+        # Vectorized MG1OP: eliminate per-frequency Python loop
+        lyman_mask_mg = freq <= 3.28805e15
+        if np.any(lyman_mask_mg):
             z = 1.0
-            freq3 = 2.815e29 / f / f / f * z**4
-
-            x = np.zeros(15)
             elim = 61671.02
+            x_mg = np.zeros((15, nfreq), dtype=np.float64)
 
-            # Levels 1-2: 3s4f states, XKARSAS(FREQ, ZEFF2, 4, 3)
+            # Levels 0-1: xkarsas (4, 3)
             for i in range(2):
-                if wno < elim - _mg1_elev[i]:
-                    break
-                zeff2 = 16.0 / _RYD_MG * (elim - _mg1_elev[i])
-                x[i] = xkarsas(f, zeff2, 4, 3)
-            # Levels 3-4: 3s4d states, XKARSAS(FREQ, ZEFF2, 4, 2)
+                thresh = elim - _mg1_elev[i]
+                mask = lyman_mask_mg & (waveno >= thresh)
+                if np.any(mask):
+                    x_mg[i, mask] = xkarsas_grid(freq[mask], 16.0 / _RYD_MG * thresh, 4, 3)
+            # Levels 2-3: xkarsas (4, 2)
             for i in range(2, 4):
-                if wno < elim - _mg1_elev[i]:
-                    break
-                zeff2 = 16.0 / _RYD_MG * (elim - _mg1_elev[i])
-                x[i] = xkarsas(f, zeff2, 4, 2)
-            # Level 5: 3s4p 1P, XKARSAS(FREQ, ZEFF2, 4, 1)
-            if wno >= elim - _mg1_elev[4]:
-                zeff2 = 16.0 / _RYD_MG * (elim - _mg1_elev[4])
-                x[4] = xkarsas(f, zeff2, 4, 1)
-            # Level 6: 3s3d 3D — analytical
-            if wno >= elim - _mg1_elev[5]:
-                x[5] = 25e-18 * (13713.986 / wno) ** 2.7
-            # Level 7: 3s4p 3P — analytical
-            if wno >= elim - _mg1_elev[6]:
-                x[6] = 33.8e-18 * (13823.223 / wno) ** 2.8
-            # Level 8: 3s3d 1D — analytical
-            if wno >= elim - _mg1_elev[7]:
-                x[7] = 45e-18 * (15267.955 / wno) ** 2.7
-            # Level 9: 3s4s 1S — analytical
-            if wno >= elim - _mg1_elev[8]:
-                x[8] = 0.43e-18 * (18167.687 / wno) ** 2.6
-            # Level 10: 3s4s 3S — analytical
-            if wno >= elim - _mg1_elev[9]:
-                x[9] = 2.1e-18 * (20473.617 / wno) ** 2.6
-            # Level 11: 3s3p 1P — analytical (two-term)
-            if wno >= elim - _mg1_elev[10]:
-                x[10] = 16e-18 * (26619.756 / wno) ** 2.1 - 7.8e-18 * (26619.756 / wno) ** 9.5
-            # Levels 12-14: 3s3p 3P (three J sub-levels) — analytical with MAX
+                thresh = elim - _mg1_elev[i]
+                mask = lyman_mask_mg & (waveno >= thresh)
+                if np.any(mask):
+                    x_mg[i, mask] = xkarsas_grid(freq[mask], 16.0 / _RYD_MG * thresh, 4, 2)
+            # Level 4: xkarsas (4, 1)
+            mask = lyman_mask_mg & (waveno >= elim - _mg1_elev[4])
+            if np.any(mask):
+                x_mg[4, mask] = xkarsas_grid(freq[mask], 16.0 / _RYD_MG * (elim - _mg1_elev[4]), 4, 1)
+            # Level 5: analytical
+            mask = lyman_mask_mg & (waveno >= elim - _mg1_elev[5])
+            if np.any(mask):
+                x_mg[5, mask] = 25e-18 * (13713.986 / waveno[mask]) ** 2.7
+            # Level 6: analytical
+            mask = lyman_mask_mg & (waveno >= elim - _mg1_elev[6])
+            if np.any(mask):
+                x_mg[6, mask] = 33.8e-18 * (13823.223 / waveno[mask]) ** 2.8
+            # Level 7: analytical
+            mask = lyman_mask_mg & (waveno >= elim - _mg1_elev[7])
+            if np.any(mask):
+                x_mg[7, mask] = 45e-18 * (15267.955 / waveno[mask]) ** 2.7
+            # Level 8: analytical
+            mask = lyman_mask_mg & (waveno >= elim - _mg1_elev[8])
+            if np.any(mask):
+                x_mg[8, mask] = 0.43e-18 * (18167.687 / waveno[mask]) ** 2.6
+            # Level 9: analytical
+            mask = lyman_mask_mg & (waveno >= elim - _mg1_elev[9])
+            if np.any(mask):
+                x_mg[9, mask] = 2.1e-18 * (20473.617 / waveno[mask]) ** 2.6
+            # Level 10: analytical (two-term)
+            mask = lyman_mask_mg & (waveno >= elim - _mg1_elev[10])
+            if np.any(mask):
+                x_mg[10, mask] = 16e-18 * (26619.756 / waveno[mask]) ** 2.1 - 7.8e-18 * (26619.756 / waveno[mask]) ** 9.5
+            # Levels 11-13: analytical with max
             for i in range(11, 14):
-                if wno >= elim - _mg1_elev[i]:
-                    xval = 20e-18 * (39759.842 / wno) ** 2.7
-                    x[i] = max(xval, 40e-18 * (39759.842 / wno) ** 14)
-            # Level 15: 3s2 1S — analytical
-            if wno >= elim - _mg1_elev[14]:
-                x[14] = 1.1e-18 * ((elim - _mg1_elev[14]) / wno) ** 10
+                mask = lyman_mask_mg & (waveno >= elim - _mg1_elev[i])
+                if np.any(mask):
+                    xval = 20e-18 * (39759.842 / waveno[mask]) ** 2.7
+                    x_mg[i, mask] = np.maximum(xval, 40e-18 * (39759.842 / waveno[mask]) ** 14)
+            # Level 14: analytical
+            mask = lyman_mask_mg & (waveno >= elim - _mg1_elev[14])
+            if np.any(mask):
+                x_mg[14, mask] = 1.1e-18 * ((elim - _mg1_elev[14]) / waveno[mask]) ** 10
 
             # Kramers-Gaunt n>=5 free-free
             gfactor = 2.0
             ryd_z2_over_25 = _RYD_MG * z**2 / 25.0
-            kff_arg = max(elim - ryd_z2_over_25, elim - wno)
-            h_kramers = (freq3 * gfactor / (_RYD_MG * z**2 * hckt)
-                         * (np.exp(-kff_arg * hckt) - np.exp(-elim * hckt)))
+            freq3_mg = 2.815e29 * z**4 / (freq ** 3)
+            kff_arg_mg = np.maximum(elim - ryd_z2_over_25, elim - waveno)
+            h_kramers_mg = (
+                freq3_mg[np.newaxis, :] * gfactor / (_RYD_MG * z**2 * hckt[:, np.newaxis])
+                * (np.exp(-kff_arg_mg[np.newaxis, :] * hckt[:, np.newaxis])
+                   - np.exp(-elim * hckt)[:, np.newaxis])
+            )
 
-            h = h_kramers + np.dot(x, bolt_mg)
-
-            amg1[:, j] = h * xnfpmg * stim_j / rho
-            smg1[:, j] = bnu_all[:, j]
+            h_mg = h_kramers_mg + bolt_mg.T @ x_mg  # (n_layers, nfreq)
+            amg1[:, lyman_mask_mg] = h_mg[:, lyman_mask_mg] * (xnfpmg * stim[:, lyman_mask_mg].T / rho).T
+            smg1[:, lyman_mask_mg] = bnu_all[:, lyman_mask_mg]
 
     # FE1OP: Iron I opacity (atlas7v.for line 6623-6665) - simpler structure
     # Fortran: FE1OP uses XNFP(J,351) — POPSALL slot 351, 1-based → index 350.
@@ -2492,106 +3184,77 @@ def compute_kapp_continuum(
 
         bolt_si = _si1_glev[:, None] * np.exp(-_si1_elev[:, None] * hckt[None, :])
 
-        for j in range(nfreq):
-            f = freq[j]
-            wno = waveno[j]
-            stim_j = stim[:, j]
-
-            if f > 3.28805e15:
-                continue
-
+        # Vectorized SI1OP: eliminate per-frequency Python loop
+        lyman_mask_si = freq <= 3.28805e15
+        if np.any(lyman_mask_si):
             z = 1.0
-            freq3 = 2.815e29 / f / f / f * z**4
+            x_si = np.zeros((33, nfreq), dtype=np.float64)
 
-            x = np.zeros(33)
-
-            # --- Group 1: Si II 2P avg limit (levels 1-22) — XKARSAS ---
-            elim1 = 65939.18
+            # Group 1: levels 0-21 — XKARSAS
+            elim1_si = 65939.18
             for i in range(22):
-                if wno < elim1 - _si1_elev[i]:
-                    break
-                zeff2 = _si1_zeff_fac[i] / _RYD_SI * (elim1 - _si1_elev[i])
+                thresh = elim1_si - _si1_elev[i]
+                mask = lyman_mask_si & (waveno >= thresh)
+                if not np.any(mask):
+                    continue
+                zeff2 = _si1_zeff_fac[i] / _RYD_SI * thresh
                 n_qn, l_qn = _si1_nl[i]
-                x[i] = xkarsas(f, zeff2, n_qn, l_qn)
+                x_si[i, mask] = xkarsas_grid(freq[mask], zeff2, n_qn, l_qn)
 
-            # --- Group 2: Si II 2P1/2 limit (levels 23-27) — Nahar & Pradhan ---
-            elim2 = 65747.55
-            # Level 23 (1S): Nahar & Pradhan + resonance
-            if wno >= elim2 - _si1_elev[22]:
-                eps = (wno - 70000.0) * 2.0 / 6500.0
-                reson1 = (97e-18 * eps + 94e-18) / (eps**2 + 1.0)
-                x[22] = (37e-18 * (50353.180 / wno) ** 2.40 + reson1) / 3.0
-            # Level 24 (1D): Nahar & Pradhan + resonance
-            if wno >= elim2 - _si1_elev[23]:
-                eps = (wno - 78600.0) * 2.0 / 13000.0
-                reson1 = (-10e-18 * eps + 77e-18) / (eps**2 + 1.0)
-                x[23] = (24.5e-18 * (59448.700 / wno) ** 1.85 + reson1) / 3.0
-            # Level 25 (3P2): Nahar & Pradhan (two-part power law)
-            if wno >= elim2 - _si1_elev[24]:
-                if wno <= 74000.0:
-                    x[24] = 72e-18 * (65524.393 / wno) ** 1.90 / 3.0
-                else:
-                    x[24] = 93e-18 * (65524.393 / wno) ** 4.00 / 3.0
-            # Level 26 (3P1)
-            if wno >= elim2 - _si1_elev[25]:
-                if wno <= 74000.0:
-                    x[25] = 72e-18 * (65524.393 / wno) ** 1.90 * 2.0 / 3.0
-                else:
-                    x[25] = 93e-18 * (65524.393 / wno) ** 4.00 * 2.0 / 3.0
-            # Level 27 (3P0)
-            if wno >= elim2 - _si1_elev[26]:
-                if wno <= 74000.0:
-                    x[26] = 72e-18 * (65524.393 / wno) ** 1.90 / 3.0
-                else:
-                    x[26] = 93e-18 * (65524.393 / wno) ** 4.00 / 3.0
+            # Group 2 + 2b: Nahar & Pradhan levels 22-26
+            for elim_g, weight in [(65747.55, 1.0 / 3.0), (65747.55 + 287.45, 2.0 / 3.0)]:
+                # Level 22 (1S)
+                m22 = lyman_mask_si & (waveno >= elim_g - _si1_elev[22])
+                if np.any(m22):
+                    wm = waveno[m22]
+                    eps = (wm - 70000.0) * 2.0 / 6500.0
+                    reson1 = (97e-18 * eps + 94e-18) / (eps**2 + 1.0)
+                    x_si[22, m22] += (37e-18 * (50353.180 / wm) ** 2.40 + reson1) * weight
+                # Level 23 (1D)
+                m23 = lyman_mask_si & (waveno >= elim_g - _si1_elev[23])
+                if np.any(m23):
+                    wm = waveno[m23]
+                    eps = (wm - 78600.0) * 2.0 / 13000.0
+                    reson1 = (-10e-18 * eps + 77e-18) / (eps**2 + 1.0)
+                    x_si[23, m23] += (24.5e-18 * (59448.700 / wm) ** 1.85 + reson1) * weight
+                # Levels 24-26 (3P): two-part power law
+                for i, w_mult in [(24, 1.0), (25, 2.0), (26, 1.0)]:
+                    mi = lyman_mask_si & (waveno >= elim_g - _si1_elev[i])
+                    if np.any(mi):
+                        wm = waveno[mi]
+                        ratio = 65524.393 / wm
+                        x_si[i, mi] += np.where(
+                            wm <= 74000.0,
+                            72e-18 * ratio ** 1.90,
+                            93e-18 * ratio ** 4.00,
+                        ) * w_mult * weight
 
-            # --- Group 2b: Si II 2P3/2 limit (levels 23-27), 2/3 weight ---
-            elim2b = 65747.55 + 287.45
-            if wno >= elim2b - _si1_elev[22]:
-                eps = (wno - 70000.0) * 2.0 / 6500.0
-                reson1 = (97e-18 * eps + 94e-18) / (eps**2 + 1.0)
-                x[22] += (37e-18 * (50353.180 / wno) ** 2.40 + reson1) * 2.0 / 3.0
-            if wno >= elim2b - _si1_elev[23]:
-                eps = (wno - 78600.0) * 2.0 / 13000.0
-                reson1 = (-10e-18 * eps + 77e-18) / (eps**2 + 1.0)
-                x[23] += (24.5e-18 * (59448.700 / wno) ** 1.85 + reson1) * 2.0 / 3.0
-            if wno >= elim2b - _si1_elev[24]:
-                if wno <= 74000.0:
-                    x[24] += 72e-18 * (65524.393 / wno) ** 1.90 * 2.0 / 3.0
-                else:
-                    x[24] += 93e-18 * (65524.393 / wno) ** 4.00 * 2.0 / 3.0
-            if wno >= elim2b - _si1_elev[25]:
-                if wno <= 74000.0:
-                    x[25] += 72e-18 * (65524.393 / wno) ** 1.90 * 2.0 / 3.0
-                else:
-                    x[25] += 93e-18 * (65524.393 / wno) ** 4.00 * 2.0 / 3.0
-            if wno >= elim2b - _si1_elev[26]:
-                if wno <= 74000.0:
-                    x[26] += 72e-18 * (65524.393 / wno) ** 1.90 * 2.0 / 3.0
-                else:
-                    x[26] += 93e-18 * (65524.393 / wno) ** 4.00 * 2.0 / 3.0
-
-            # --- Group 3: Si II 4P1/2 limit (levels 28-33) — XKARSAS ---
-            elim3 = 65747.5 + 42824.35
+            # Group 3: levels 27-32 — XKARSAS (3, 1)
+            elim3_si = 65747.5 + 42824.35
             degen_si = 3.0
             for i in range(27, 33):
-                if wno < elim3 - _si1_elev[i]:
-                    break
-                zeff2 = 9.0 / _RYD_SI * (elim3 - _si1_elev[i])
-                x[i] = xkarsas(f, zeff2, 3, 1) * degen_si
+                thresh = elim3_si - _si1_elev[i]
+                mask = lyman_mask_si & (waveno >= thresh)
+                if not np.any(mask):
+                    continue
+                zeff2 = 9.0 / _RYD_SI * thresh
+                x_si[i, mask] = xkarsas_grid(freq[mask], zeff2, 3, 1) * degen_si
 
             # Kramers-Gaunt n>=5 free-free
-            elim_ff = 65747.55
-            gfactor = 6.0
+            elim_ff_si = 65747.55
+            gfactor_si = 6.0
             ryd_z2_25 = _RYD_SI * z**2 / 25.0
-            kff_arg = max(elim_ff - ryd_z2_25, elim_ff - wno)
-            h_kramers = (freq3 * gfactor / (_RYD_SI * z**2 * hckt)
-                         * (np.exp(-kff_arg * hckt) - np.exp(-elim_ff * hckt)))
+            freq3_si = 2.815e29 * z**4 / (freq ** 3)
+            kff_arg_si = np.maximum(elim_ff_si - ryd_z2_25, elim_ff_si - waveno)
+            h_kramers_si = (
+                freq3_si[np.newaxis, :] * gfactor_si / (_RYD_SI * z**2 * hckt[:, np.newaxis])
+                * (np.exp(-kff_arg_si[np.newaxis, :] * hckt[:, np.newaxis])
+                   - np.exp(-elim_ff_si * hckt)[:, np.newaxis])
+            )
 
-            h = h_kramers + np.dot(x, bolt_si)
-
-            asi1[:, j] = h * xnfpsi * stim_j / rho
-            ssi1[:, j] = bnu_all[:, j]
+            h_si = h_kramers_si + bolt_si.T @ x_si
+            asi1[:, lyman_mask_si] = h_si[:, lyman_mask_si] * (xnfpsi * stim[:, lyman_mask_si].T / rho).T
+            ssi1[:, lyman_mask_si] = bnu_all[:, lyman_mask_si]
 
     # LUKEOP: Lukewarm star opacity (atlas7v.for line 8952-8977)
     # Computes: N1OP, O1OP, MG2OP, SI2OP, CA2OP
@@ -2700,181 +3363,231 @@ def compute_kapp_continuum(
             / (109732.298 * 4.0 * hckt)
         )
 
-        for j in range(nfreq):
-            f = freq[j]
-            freqlg = np.log(f)
-            stim_j = stim[:, j]
+        mg2_n_arr = np.array([n for n, _ in mg2_nl], dtype=np.int64)
+        mg2_l_arr = np.array([l for _, l in mg2_nl], dtype=np.int64)
 
-            # N1OP: Nitrogen I opacity (atlas7v.for line 8978-9005)
-            # Uses SEATON cross-sections at 3 edges: 853Å, 1020Å, 1130Å
-            c1130 = 6.0 * np.exp(-3.575 / tkev)  # Level population factor
-            c1020 = 10.0 * np.exp(-2.384 / tkev)
-
-            x853 = 0.0
-            x1020 = 0.0
-            x1130 = 0.0
-
-            if f >= 3.517915e15:  # 853 Å edge
-                x853 = _seaton(3.517915e15, 1.142e-17, 2.0, 4.29, f)
-            if f >= 2.941534e15:  # 1020 Å edge
-                x1020 = _seaton(2.941534e15, 4.41e-18, 1.5, 3.85, f)
-            if f >= 2.653317e15:  # 1130 Å edge
-                x1130 = _seaton(2.653317e15, 4.2e-18, 1.5, 4.34, f)
-
-            n1op = x853 * 4.0 + x1020 * c1020 + x1130 * c1130  # (n_layers,)
-
-            # O1OP: Oxygen I opacity (atlas7v.for line 9006-9019)
-            x911 = 0.0
-            if f >= 3.28805e15:  # 911 Å edge
-                x911 = _seaton(3.28805e15, 2.94e-18, 1.0, 2.66, f)
-            o1op = x911 * 9.0  # scalar, broadcast to layers
-
-            mg2_x = np.zeros(14, dtype=np.float64)
-            for i in range(13):
-                if waveno[j] < mg2_elim - mg2_elev[i]:
-                    break
-                zeff2 = mg2_zeff_num[i] / mg2_ryd * (mg2_elim - mg2_elev[i])
-                n_qn, l_qn = mg2_nl[i]
-                mg2_x[i] = xkarsas(f, zeff2, n_qn, l_qn)
-            if waveno[j] >= mg2_elim - mg2_elev[13]:
-                ratio = (mg2_elim - mg2_elev[13]) / max(waveno[j], 1e-300)
-                mg2_x[13] = 0.14e-18 * (6.700 * ratio**4 - 5.700 * ratio**5)
-            mg2_freq3 = 2.815e29 / max(f * f * f, 1e-300) * mg2_z**4
-            mg2_pref = mg2_freq3 / (mg2_ryd * mg2_z**2 * hckt)
-            mg2_h = mg2_pref * (
-                np.exp(-np.maximum(mg2_kthresh, mg2_elim - waveno[j]) * hckt)
-                - mg2_exp2
+        if _NUMBA_AVAILABLE and not trace_enabled():
+            _lukeop_aluke_nb(
+                aluke,
+                np.ascontiguousarray(freq, dtype=np.float64),
+                np.ascontiguousarray(waveno, dtype=np.float64),
+                np.ascontiguousarray(stim, dtype=np.float64),
+                np.ascontiguousarray(ehvkt, dtype=np.float64),
+                np.ascontiguousarray(hckt, dtype=np.float64),
+                np.ascontiguousarray(tkev, dtype=np.float64),
+                np.ascontiguousarray(rho, dtype=np.float64),
+                np.ascontiguousarray(xnfpn, dtype=np.float64),
+                np.ascontiguousarray(xnfpo, dtype=np.float64),
+                np.ascontiguousarray(xnfpc2, dtype=np.float64),
+                np.ascontiguousarray(xnfpmg2, dtype=np.float64),
+                np.ascontiguousarray(xnfpsi2, dtype=np.float64),
+                np.ascontiguousarray(xnfpca2, dtype=np.float64),
+                np.ascontiguousarray(mg2_elev, dtype=np.float64),
+                np.ascontiguousarray(mg2_zeff_num, dtype=np.float64),
+                mg2_n_arr,
+                mg2_l_arr,
+                np.ascontiguousarray(mg2_bolt, dtype=np.float64),
+                np.ascontiguousarray(mg2_exp2, dtype=np.float64),
+                float(mg2_kthresh),
+                float(mg2_elim),
+                float(mg2_ryd),
+                np.ascontiguousarray(c2_elev, dtype=np.float64),
+                np.ascontiguousarray(c2_bolt, dtype=np.float64),
+                np.ascontiguousarray(c2_a, dtype=np.float64),
+                np.ascontiguousarray(c2_b, dtype=np.float64),
+                float(c2_k1),
+                float(c2_k2),
+                float(c2_elim1),
+                float(c2_elim2),
+                float(c2_elim3),
+                float(c2_ryd),
+                float(c2_freq_factor),
+                np.ascontiguousarray(_SI2OP12_XTAB, dtype=np.float64),
+                np.ascontiguousarray(si2_it, dtype=np.int64),
+                np.ascontiguousarray(si2_tfrac, dtype=np.float64),
+                np.ascontiguousarray(si2_boltn, dtype=np.float64),
+                FREQ_LOG,
+                XN_LOG,
+                XL_LOG_ARRAY,
+                EKARSAS,
+                LN10,
             )
-            mg2_h = mg2_h + np.dot(mg2_x, mg2_bolt)
-            mg2op = mg2_h * xnfpmg2 * stim_j / rho
-
-            # C2OP: atlas12.for SUBROUTINE C2OP (lines 8297-8570)
-            c2_x = np.zeros(34, dtype=np.float64)
-            for i, (n_qn, l_qn) in enumerate([(5, 4), (5, 3), (5, 2), (5, 1), (5, 0), (4, 3), (4, 2), (4, 1), (4, 0), (3, 2), (3, 1), (3, 0)]):
-                if waveno[j] < c2_elim1 - c2_elev[i]:
-                    break
-                zeff2 = (25.0 if n_qn == 5 else 16.0 if n_qn == 4 else 9.0) / c2_ryd * (c2_elim1 - c2_elev[i])
-                c2_x[i] = xkarsas(f, zeff2, n_qn, l_qn)
-            for i in range(13, 19):
-                if waveno[j] < c2_elim2 - c2_elev[i]:
-                    break
-                c2_x[i] = xkarsas(f, 9.0 / c2_ryd * (c2_elim2 - c2_elev[i]), 3, 2)
-            for i in range(19, 25):
-                if waveno[j] < c2_elim2 - c2_elev[i]:
-                    break
-                c2_x[i] = xkarsas(f, 9.0 / c2_ryd * (c2_elim2 - c2_elev[i]), 3, 1)
-            for i in range(25, 27):
-                if waveno[j] < c2_elim2 - c2_elev[i]:
-                    break
-                c2_x[i] = xkarsas(f, 9.0 / c2_ryd * (c2_elim2 - c2_elev[i]), 3, 0)
-            for i in range(31, 34):
-                if waveno[j] < c2_elim3 - c2_elev[i]:
-                    break
-                c2_x[i] = 3.0 * xkarsas(f, 4.0 / c2_ryd * (c2_elim3 - c2_elev[i]), 2, 1)
-            c2_freq3 = c2_freq_factor / max(f * f * f, 1e-300)
-            c2_h = c2_freq3 / (c2_ryd * c2_z**2 * hckt) * (
-                np.exp(-np.maximum(c2_k1, c2_elim1 - waveno[j]) * hckt) - c2_a
-            )
-            c2_h = c2_h + c2_freq3 * 9.0 / (c2_ryd * c2_z**2 * hckt) * (
-                np.exp(-np.maximum(c2_k2, c2_elim2 - waveno[j]) * hckt) - c2_b
-            )
-            c2_h = c2_h + np.dot(c2_x, c2_bolt)
-            c2op = c2_h * xnfpc2 * stim_j / rho
-
-            # SI2OP: atlas12.for SUBROUTINE SI2OP (lines 8745-9177)
-            if waveno[j] >= 12192.48:
-                iw = int(waveno[j] * 0.001)
-                iw = max(min(iw, 199), 1)
-                wfrac = (waveno[j] - iw * 1000.0) / 1000.0
-                i0 = iw - 1  # Fortran IW (1-based) -> Python 0-based
-                i1 = iw      # Fortran IW+1
-                it0 = si2_it - 1  # Fortran IT
-                it1 = si2_it      # Fortran IT+1
-                h00 = _SI2OP12_XTAB[i0, it0]
-                h01 = _SI2OP12_XTAB[i0, it1]
-                h10 = _SI2OP12_XTAB[i1, it0]
-                h11 = _SI2OP12_XTAB[i1, it1]
-                h0 = h00 * (1.0 - si2_tfrac) + h01 * si2_tfrac
-                h1 = h10 * (1.0 - si2_tfrac) + h11 * si2_tfrac
-                si2op = np.exp(h0 * (1.0 - wfrac) + h1 * wfrac) * xnfpsi2 * stim_j / rho
-            else:
-                si2_freq3 = 2.815e29 * (2.0**4) / max(f * f * f, 1e-300)
-                si2_h = si2_freq3 * (1.0 / np.maximum(ehvkt[:, j], 1e-300) - 1.0) * si2_boltn
-                si2op = si2_h * xnfpsi2 * stim_j / rho
-
-            # CA2OP: Calcium II opacity (atlas7v.for line 9098-9122)
-            c1218 = 10.0 * np.exp(-1.697 / tkev)
-            c1420 = 6.0 * np.exp(-3.142 / tkev)
-            x1044 = 0.0
-            x1218 = 0.0
-            x1420 = 0.0
-            if f >= 2.870454e15:  # 1044 Å edge
-                x1044 = 5.4e-20 * (2.870454e15 / f) ** 3
-            if f >= 2.460127e15:  # 1218 Å edge
-                x1218 = 1.64e-17 * np.sqrt(2.460127e15 / f)
-            if f >= 2.110779e15:  # 1420 Å edge
-                x1420 = _seaton(2.110779e15, 4.13e-18, 3.0, 0.69, f)
-            ca2op = x1044 * 2.0 + x1218 * c1218 + x1420 * c1420  # (n_layers,)
-
-            # Match Fortran LUKEOP weighting by ion populations.
-            luke_n1 = n1op * xnfpn * stim_j / rho
-            luke_o1 = o1op * xnfpo * stim_j / rho
-            luke_ca2 = ca2op * xnfpca2 * stim_j / rho
-            luke_c2 = c2op
-            luke_mg2 = mg2op
-            luke_si2 = si2op
-            aluke[:, j] = luke_n1 + luke_o1 + luke_ca2 + luke_c2 + luke_mg2 + luke_si2
-            if trace_enabled():
-                wv = float(wavelength_nm[j])
-                iwlk = int(np.log(max(wv, 1e-300)) / np.log(1.0 + 1.0 / 2_000_000.0) + 0.5)
-                for k in range(n_layers):
-                    if not trace_in_focus(wlvac_nm=wv, j0=k):
-                        continue
-                    trace_emit(
-                        event="luke_terms1",
-                        iter_num=1,
-                        line_num_1b=0,
-                        depth_1b=k + 1,
-                        nu_1b=iwlk,
-                        type_code=0,
-                        wlvac_nm=wv,
-                        center=float(luke_n1[k]),
-                        adamp=float(luke_o1[k]),
-                        cv=float(luke_ca2[k]),
-                        tabcont=float(aluke[k, j]),
-                        branch="lukeop",
-                        reason="n1_o1_ca2",
-                    )
-                    trace_emit(
-                        event="luke_terms2",
-                        iter_num=1,
-                        line_num_1b=0,
-                        depth_1b=k + 1,
-                        nu_1b=iwlk,
-                        type_code=0,
-                        wlvac_nm=wv,
-                        center=float(luke_c2[k]),
-                        adamp=float(luke_mg2[k]),
-                        cv=float(luke_si2[k]),
-                        tabcont=float(aluke[k, j]),
-                        branch="lukeop",
-                        reason="c2_mg2_si2",
-                    )
-                    trace_emit(
-                        event="luke_pop",
-                        iter_num=1,
-                        line_num_1b=0,
-                        depth_1b=k + 1,
-                        nu_1b=iwlk,
-                        type_code=0,
-                        wlvac_nm=wv,
-                        center=float(xnfp_all[k, 21] if xnfp_all.shape[1] > 21 else 0.0),
-                        adamp=float(xnfpmg2[k]),
-                        cv=float(xnfpsi2[k]),
-                        tabcont=float(rho[k]),
-                        branch="lukeop",
-                        reason="xnfp_c2_mg2_si2",
-                    )
+        if not (_NUMBA_AVAILABLE and not trace_enabled()):
+            for j in range(nfreq):
+                f = freq[j]
+                freqlg = np.log(f)
+                stim_j = stim[:, j]
+    
+                # N1OP: Nitrogen I opacity (atlas7v.for line 8978-9005)
+                # Uses SEATON cross-sections at 3 edges: 853Å, 1020Å, 1130Å
+                c1130 = 6.0 * np.exp(-3.575 / tkev)  # Level population factor
+                c1020 = 10.0 * np.exp(-2.384 / tkev)
+    
+                x853 = 0.0
+                x1020 = 0.0
+                x1130 = 0.0
+    
+                if f >= 3.517915e15:  # 853 Å edge
+                    x853 = _seaton(3.517915e15, 1.142e-17, 2.0, 4.29, f)
+                if f >= 2.941534e15:  # 1020 Å edge
+                    x1020 = _seaton(2.941534e15, 4.41e-18, 1.5, 3.85, f)
+                if f >= 2.653317e15:  # 1130 Å edge
+                    x1130 = _seaton(2.653317e15, 4.2e-18, 1.5, 4.34, f)
+    
+                n1op = x853 * 4.0 + x1020 * c1020 + x1130 * c1130  # (n_layers,)
+    
+                # O1OP: Oxygen I opacity (atlas7v.for line 9006-9019)
+                x911 = 0.0
+                if f >= 3.28805e15:  # 911 Å edge
+                    x911 = _seaton(3.28805e15, 2.94e-18, 1.0, 2.66, f)
+                o1op = x911 * 9.0  # scalar, broadcast to layers
+    
+                mg2_x = np.zeros(14, dtype=np.float64)
+                for i in range(13):
+                    if waveno[j] < mg2_elim - mg2_elev[i]:
+                        break
+                    zeff2 = mg2_zeff_num[i] / mg2_ryd * (mg2_elim - mg2_elev[i])
+                    n_qn, l_qn = mg2_nl[i]
+                    mg2_x[i] = xkarsas(f, zeff2, n_qn, l_qn)
+                if waveno[j] >= mg2_elim - mg2_elev[13]:
+                    ratio = (mg2_elim - mg2_elev[13]) / max(waveno[j], 1e-300)
+                    mg2_x[13] = 0.14e-18 * (6.700 * ratio**4 - 5.700 * ratio**5)
+                mg2_freq3 = 2.815e29 / max(f * f * f, 1e-300) * mg2_z**4
+                mg2_pref = mg2_freq3 / (mg2_ryd * mg2_z**2 * hckt)
+                mg2_h = mg2_pref * (
+                    np.exp(-np.maximum(mg2_kthresh, mg2_elim - waveno[j]) * hckt)
+                    - mg2_exp2
+                )
+                mg2_h = mg2_h + np.dot(mg2_x, mg2_bolt)
+                mg2op = mg2_h * xnfpmg2 * stim_j / rho
+    
+                # C2OP: atlas12.for SUBROUTINE C2OP (lines 8297-8570)
+                c2_x = np.zeros(34, dtype=np.float64)
+                for i, (n_qn, l_qn) in enumerate([(5, 4), (5, 3), (5, 2), (5, 1), (5, 0), (4, 3), (4, 2), (4, 1), (4, 0), (3, 2), (3, 1), (3, 0)]):
+                    if waveno[j] < c2_elim1 - c2_elev[i]:
+                        break
+                    zeff2 = (25.0 if n_qn == 5 else 16.0 if n_qn == 4 else 9.0) / c2_ryd * (c2_elim1 - c2_elev[i])
+                    c2_x[i] = xkarsas(f, zeff2, n_qn, l_qn)
+                for i in range(13, 19):
+                    if waveno[j] < c2_elim2 - c2_elev[i]:
+                        break
+                    c2_x[i] = xkarsas(f, 9.0 / c2_ryd * (c2_elim2 - c2_elev[i]), 3, 2)
+                for i in range(19, 25):
+                    if waveno[j] < c2_elim2 - c2_elev[i]:
+                        break
+                    c2_x[i] = xkarsas(f, 9.0 / c2_ryd * (c2_elim2 - c2_elev[i]), 3, 1)
+                for i in range(25, 27):
+                    if waveno[j] < c2_elim2 - c2_elev[i]:
+                        break
+                    c2_x[i] = xkarsas(f, 9.0 / c2_ryd * (c2_elim2 - c2_elev[i]), 3, 0)
+                for i in range(31, 34):
+                    if waveno[j] < c2_elim3 - c2_elev[i]:
+                        break
+                    c2_x[i] = 3.0 * xkarsas(f, 4.0 / c2_ryd * (c2_elim3 - c2_elev[i]), 2, 1)
+                c2_freq3 = c2_freq_factor / max(f * f * f, 1e-300)
+                c2_h = c2_freq3 / (c2_ryd * c2_z**2 * hckt) * (
+                    np.exp(-np.maximum(c2_k1, c2_elim1 - waveno[j]) * hckt) - c2_a
+                )
+                c2_h = c2_h + c2_freq3 * 9.0 / (c2_ryd * c2_z**2 * hckt) * (
+                    np.exp(-np.maximum(c2_k2, c2_elim2 - waveno[j]) * hckt) - c2_b
+                )
+                c2_h = c2_h + np.dot(c2_x, c2_bolt)
+                c2op = c2_h * xnfpc2 * stim_j / rho
+    
+                # SI2OP: atlas12.for SUBROUTINE SI2OP (lines 8745-9177)
+                if waveno[j] >= 12192.48:
+                    iw = int(waveno[j] * 0.001)
+                    iw = max(min(iw, 199), 1)
+                    wfrac = (waveno[j] - iw * 1000.0) / 1000.0
+                    i0 = iw - 1  # Fortran IW (1-based) -> Python 0-based
+                    i1 = iw      # Fortran IW+1
+                    it0 = si2_it - 1  # Fortran IT
+                    it1 = si2_it      # Fortran IT+1
+                    h00 = _SI2OP12_XTAB[i0, it0]
+                    h01 = _SI2OP12_XTAB[i0, it1]
+                    h10 = _SI2OP12_XTAB[i1, it0]
+                    h11 = _SI2OP12_XTAB[i1, it1]
+                    h0 = h00 * (1.0 - si2_tfrac) + h01 * si2_tfrac
+                    h1 = h10 * (1.0 - si2_tfrac) + h11 * si2_tfrac
+                    si2op = np.exp(h0 * (1.0 - wfrac) + h1 * wfrac) * xnfpsi2 * stim_j / rho
+                else:
+                    si2_freq3 = 2.815e29 * (2.0**4) / max(f * f * f, 1e-300)
+                    si2_h = si2_freq3 * (1.0 / np.maximum(ehvkt[:, j], 1e-300) - 1.0) * si2_boltn
+                    si2op = si2_h * xnfpsi2 * stim_j / rho
+    
+                # CA2OP: Calcium II opacity (atlas7v.for line 9098-9122)
+                c1218 = 10.0 * np.exp(-1.697 / tkev)
+                c1420 = 6.0 * np.exp(-3.142 / tkev)
+                x1044 = 0.0
+                x1218 = 0.0
+                x1420 = 0.0
+                if f >= 2.870454e15:  # 1044 Å edge
+                    x1044 = 5.4e-20 * (2.870454e15 / f) ** 3
+                if f >= 2.460127e15:  # 1218 Å edge
+                    x1218 = 1.64e-17 * np.sqrt(2.460127e15 / f)
+                if f >= 2.110779e15:  # 1420 Å edge
+                    x1420 = _seaton(2.110779e15, 4.13e-18, 3.0, 0.69, f)
+                ca2op = x1044 * 2.0 + x1218 * c1218 + x1420 * c1420  # (n_layers,)
+    
+                # Match Fortran LUKEOP weighting by ion populations.
+                luke_n1 = n1op * xnfpn * stim_j / rho
+                luke_o1 = o1op * xnfpo * stim_j / rho
+                luke_ca2 = ca2op * xnfpca2 * stim_j / rho
+                luke_c2 = c2op
+                luke_mg2 = mg2op
+                luke_si2 = si2op
+                aluke[:, j] = luke_n1 + luke_o1 + luke_ca2 + luke_c2 + luke_mg2 + luke_si2
+                if trace_enabled():
+                    wv = float(wavelength_nm[j])
+                    iwlk = int(np.log(max(wv, 1e-300)) / np.log(1.0 + 1.0 / 2_000_000.0) + 0.5)
+                    for k in range(n_layers):
+                        if not trace_in_focus(wlvac_nm=wv, j0=k):
+                            continue
+                        trace_emit(
+                            event="luke_terms1",
+                            iter_num=1,
+                            line_num_1b=0,
+                            depth_1b=k + 1,
+                            nu_1b=iwlk,
+                            type_code=0,
+                            wlvac_nm=wv,
+                            center=float(luke_n1[k]),
+                            adamp=float(luke_o1[k]),
+                            cv=float(luke_ca2[k]),
+                            tabcont=float(aluke[k, j]),
+                            branch="lukeop",
+                            reason="n1_o1_ca2",
+                        )
+                        trace_emit(
+                            event="luke_terms2",
+                            iter_num=1,
+                            line_num_1b=0,
+                            depth_1b=k + 1,
+                            nu_1b=iwlk,
+                            type_code=0,
+                            wlvac_nm=wv,
+                            center=float(luke_c2[k]),
+                            adamp=float(luke_mg2[k]),
+                            cv=float(luke_si2[k]),
+                            tabcont=float(aluke[k, j]),
+                            branch="lukeop",
+                            reason="c2_mg2_si2",
+                        )
+                        trace_emit(
+                            event="luke_pop",
+                            iter_num=1,
+                            line_num_1b=0,
+                            depth_1b=k + 1,
+                            nu_1b=iwlk,
+                            type_code=0,
+                            wlvac_nm=wv,
+                            center=float(xnfp_all[k, 21] if xnfp_all.shape[1] > 21 else 0.0),
+                            adamp=float(xnfpmg2[k]),
+                            cv=float(xnfpsi2[k]),
+                            tabcont=float(rho[k]),
+                            branch="lukeop",
+                            reason="xnfp_c2_mg2_si2",
+                        )
     else:
         logger.debug("Skipping LUKEOP - IFOP(10)=0")
 
@@ -2920,6 +3633,12 @@ def compute_kapp_continuum(
             -HOTOP_TRANSITIONS[:, 5][np.newaxis, :] / np.maximum(tkev[:, np.newaxis], 1e-30)
         )
         hot_id_idx = np.clip(HOTOP_TRANSITIONS[:, 6].astype(np.int64) - 1, 0, 20)
+        _hot_freq0 = np.ascontiguousarray(HOTOP_TRANSITIONS[:, 0], dtype=np.float64)
+        _hot_xsect0 = np.ascontiguousarray(HOTOP_TRANSITIONS[:, 1], dtype=np.float64)
+        _hot_alpha0 = np.ascontiguousarray(HOTOP_TRANSITIONS[:, 2], dtype=np.float64)
+        _hot_power0 = np.ascontiguousarray(HOTOP_TRANSITIONS[:, 3], dtype=np.float64)
+        _hot_mult0 = np.ascontiguousarray(HOTOP_TRANSITIONS[:, 4], dtype=np.float64)
+        _hot_id_idx_arr = np.ascontiguousarray(hot_id_idx, dtype=np.int64)
         chunk = 4096
 
         for i0 in range(0, nfreq, chunk):
@@ -2940,26 +3659,40 @@ def compute_kapp_continuum(
             )
 
             # Bound-free additions from HOTOP transition table (atlas7v.for line 9291-9302)
-            for k in range(HOTOP_TRANSITIONS.shape[0]):
-                freq0, xsect0, alpha0, power0, mult0, _, _ = HOTOP_TRANSITIONS[k]
-                use = f_chunk >= freq0
-                if not np.any(use):
-                    continue
-                ratio = freq0 / f_chunk[use]
-                xsect = xsect0 * (
-                    alpha0 + ratio - alpha0 * ratio
-                ) * np.sqrt(ratio ** int(power0))
-                xx = (
-                    xsect[np.newaxis, :]
-                    * hotop_xnfp[:, hot_id_idx[k]][:, np.newaxis]
-                    * mult0
+            if _NUMBA_AVAILABLE:
+                _hotop_boundfree_nb(
+                    ahot_chunk,
+                    f_chunk,
+                    hotop_xnfp,
+                    exp_hot,
+                    _hot_freq0,
+                    _hot_xsect0,
+                    _hot_alpha0,
+                    _hot_power0,
+                    _hot_mult0,
+                    _hot_id_idx_arr,
                 )
-                threshold = ahot_chunk[:, use] / 100.0
-                ahot_chunk[:, use] += np.where(
-                    xx > threshold,
-                    xx * exp_hot[:, k][:, np.newaxis],
-                    0.0,
-                )
+            else:
+                for k in range(HOTOP_TRANSITIONS.shape[0]):
+                    freq0, xsect0, alpha0, power0, mult0, _, _ = HOTOP_TRANSITIONS[k]
+                    use = f_chunk >= freq0
+                    if not np.any(use):
+                        continue
+                    ratio = freq0 / f_chunk[use]
+                    xsect = xsect0 * (
+                        alpha0 + ratio - alpha0 * ratio
+                    ) * np.sqrt(ratio ** int(power0))
+                    xx = (
+                        xsect[np.newaxis, :]
+                        * hotop_xnfp[:, hot_id_idx[k]][:, np.newaxis]
+                        * mult0
+                    )
+                    threshold = ahot_chunk[:, use] / 100.0
+                    ahot_chunk[:, use] += np.where(
+                        xx > threshold,
+                        xx * exp_hot[:, k][:, np.newaxis],
+                        0.0,
+                    )
 
             ahot[:, i0:i1] = ahot_chunk * stim_chunk / rho[:, np.newaxis]
     else:

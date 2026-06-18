@@ -2,15 +2,53 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+
 import numpy as np
 
 from .populations import pops
+from .pops_parallel import pops_parallel_enabled, pops_parallel_workers
 from .runtime import AtlasRuntimeState
 
 
 def _nn_from_code(code: float) -> int:
     frac = float(code) - float(int(code))
     return max(1, int(frac * 100.0 + 1.5))
+
+
+@dataclass(frozen=True)
+class _PopsAllJob:
+    code: float
+    mode: int
+    col0: int
+    nout: int
+
+
+def _run_popsall_job(
+    job: _PopsAllJob,
+    *,
+    temperature_k: np.ndarray,
+    tk_erg: np.ndarray,
+    state: AtlasRuntimeState,
+    ifmol: bool,
+    ifpres: bool,
+    itemp: int,
+    itemp_cache: dict[str, int],
+) -> None:
+    sl = slice(job.col0, job.col0 + job.nout)
+    pops(
+        code=job.code,
+        mode=job.mode,
+        out=state.xnf[:, sl] if job.mode == 12 else state.xnfp[:, sl],
+        ifmol=ifmol,
+        ifpres=ifpres,
+        temperature_k=temperature_k,
+        tk_erg=tk_erg,
+        state=state,
+        itemp=itemp,
+        itemp_cache=itemp_cache,
+    )
 
 
 def popsall(
@@ -96,38 +134,13 @@ def popsall(
         (30.02, 465),
     ]
 
+    jobs: list[_PopsAllJob] = []
     for code, start_1based in mode12_calls:
         nout = _nn_from_code(code)
-        slot0 = start_1based - 1
-        sl = slice(slot0, slot0 + nout)
-        pops(
-            code=code,
-            mode=12,
-            out=state.xnf[:, sl],
-            ifmol=ifmol,
-            ifpres=ifpres,
-            temperature_k=temperature_k,
-            tk_erg=tk_erg,
-            state=state,
-            itemp=itemp,
-            itemp_cache=itemp_cache,
-        )
+        jobs.append(_PopsAllJob(code=code, mode=12, col0=start_1based - 1, nout=nout))
     for code, start_1based in mode11_calls:
         nout = _nn_from_code(code)
-        slot0 = start_1based - 1
-        sl = slice(slot0, slot0 + nout)
-        pops(
-            code=code,
-            mode=11,
-            out=state.xnfp[:, sl],
-            ifmol=ifmol,
-            ifpres=ifpres,
-            temperature_k=temperature_k,
-            tk_erg=tk_erg,
-            state=state,
-            itemp=itemp,
-            itemp_cache=itemp_cache,
-        )
+        jobs.append(_PopsAllJob(code=code, mode=11, col0=start_1based - 1, nout=nout))
 
     # Z=31..99 (Fortran starts each element at 496 + (Z-31)*5 and calls
     # POPS with code Z+0.02 for both mode 11 and 12).
@@ -135,33 +148,20 @@ def popsall(
         code = float(z) + 0.02
         slot0 = 495 + (z - 31) * 5
         nout = _nn_from_code(code)
-        sl = slice(slot0, slot0 + nout)
-        pops(
-            code=code,
-            mode=11,
-            out=state.xnfp[:, sl],
-            ifmol=ifmol,
-            ifpres=ifpres,
-            temperature_k=temperature_k,
-            tk_erg=tk_erg,
-            state=state,
-            itemp=itemp,
-            itemp_cache=itemp_cache,
-        )
-        pops(
-            code=code,
-            mode=12,
-            out=state.xnf[:, sl],
-            ifmol=ifmol,
-            ifpres=ifpres,
-            temperature_k=temperature_k,
-            tk_erg=tk_erg,
-            state=state,
-            itemp=itemp,
-            itemp_cache=itemp_cache,
-        )
+        jobs.append(_PopsAllJob(code=code, mode=11, col0=slot0, nout=nout))
+        jobs.append(_PopsAllJob(code=code, mode=12, col0=slot0, nout=nout))
 
     if not ifmol:
+        _dispatch_popsall_jobs(
+            jobs,
+            temperature_k=temperature_k,
+            tk_erg=tk_erg,
+            state=state,
+            ifmol=ifmol,
+            ifpres=ifpres,
+            itemp=itemp,
+            itemp_cache=itemp_cache,
+        )
         return
 
     # Molecular slots from atlas12.for POPSALL (lines 4831-4846), where
@@ -188,29 +188,61 @@ def popsall(
         col0 = nelion_1based - 1
         if col0 < 0 or col0 >= state.xnfp.shape[1]:
             continue
-        sl = slice(col0, col0 + 1)
-        pops(
-            code=code,
-            mode=1,
-            out=state.xnfp[:, sl],
-            ifmol=ifmol,
-            ifpres=ifpres,
-            temperature_k=temperature_k,
-            tk_erg=tk_erg,
-            state=state,
-            itemp=itemp,
-            itemp_cache=itemp_cache,
-        )
-        pops(
-            code=code,
-            mode=11,
-            out=state.xnfp[:, sl],
-            ifmol=ifmol,
-            ifpres=ifpres,
-            temperature_k=temperature_k,
-            tk_erg=tk_erg,
-            state=state,
-            itemp=itemp,
-            itemp_cache=itemp_cache,
-        )
+        jobs.append(_PopsAllJob(code=code, mode=1, col0=col0, nout=1))
+        jobs.append(_PopsAllJob(code=code, mode=11, col0=col0, nout=1))
 
+    _dispatch_popsall_jobs(
+        jobs,
+        temperature_k=temperature_k,
+        tk_erg=tk_erg,
+        state=state,
+        ifmol=ifmol,
+        ifpres=ifpres,
+        itemp=itemp,
+        itemp_cache=itemp_cache,
+    )
+
+
+def _dispatch_popsall_jobs(
+    jobs: list[_PopsAllJob],
+    *,
+    temperature_k: np.ndarray,
+    tk_erg: np.ndarray,
+    state: AtlasRuntimeState,
+    ifmol: bool,
+    ifpres: bool,
+    itemp: int,
+    itemp_cache: dict[str, int],
+) -> None:
+    """Run independent POPS calls; each writes a disjoint XNF/XNFP slice."""
+    if pops_parallel_enabled() and len(jobs) > 1:
+        workers = min(pops_parallel_workers(), len(jobs))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(
+                pool.map(
+                    lambda job: _run_popsall_job(
+                        job,
+                        temperature_k=temperature_k,
+                        tk_erg=tk_erg,
+                        state=state,
+                        ifmol=ifmol,
+                        ifpres=ifpres,
+                        itemp=itemp,
+                        itemp_cache=itemp_cache,
+                    ),
+                    jobs,
+                )
+            )
+        return
+
+    for job in jobs:
+        _run_popsall_job(
+            job,
+            temperature_k=temperature_k,
+            tk_erg=tk_erg,
+            state=state,
+            ifmol=ifmol,
+            ifpres=ifpres,
+            itemp=itemp,
+            itemp_cache=itemp_cache,
+        )

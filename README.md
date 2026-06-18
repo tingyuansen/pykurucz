@@ -75,9 +75,29 @@ python pykurucz.py --teff 4800 --logg 1.5 \
   CO, C₂, CH, OH, MgH, FeH, and ~50 molecular species in total. On by
   default when `data/molecules/` is populated.
 
+## Performance & validation (`perf/pipeline-optimizations` branch)
+
+This branch is a **pure-Python** speed pass (NumPy / SciPy / Numba — no C, no
+Fortran toolchain) that makes single-thread pykurucz competitive with
+single-thread Fortran while keeping flux within **1%** of the Fortran reference.
+Highlights:
+
+- **Numba-JIT'd hot paths** — `PFSAHA` and `NMOLEC` (the two biggest pure-Python
+  hotspots) ported to bit-identical Numba kernels; `float32` discipline in the
+  `LINOP1`/`XLINOP` line kernels (also a Fortran `REAL*4` fidelity fix).
+- **Fortran-faithful convergence stop** — early-stop now mirrors
+  `checkconv.f90` (deep-layer `max|ΔT/T| < 1e-4`), replacing a Python-invented
+  all-column metric. **−14.4% grid wall @1T, −7.4% @12T**, fully parity-safe.
+- **Sparse SYNTHE `ASYNTH` + NPZ caching**, and a leaner `float32` molecular
+  kernel (~1 GB less RAM).
+
+**For reviewers:** [`BRANCH_REVIEW.md`](BRANCH_REVIEW.md) lists every change, the
+measured numbers, the parity gate, and exact `pykurucz.py` commands to **run and
+stress-test** the branch.
+
 ## Known limitation: extreme cool-RSG α-perturbed cells
 
-In a narrow corner — cool ($T_{\rm eff} \lesssim 4500$ K), low-gravity ($\log g = 0$) atmospheres with non-zero `--am` and small `--abund C:` perturbations — the kurucz-a1 emulator's prior is far enough from the true converged solution that ATLAS iterates into all-NaN before recovering. The defensive guards in this branch (Fixes 12 / 13 in `PYKURUCZ_FIXES.md`) catch the failure cleanly with a `RuntimeError` rather than silently writing a degenerate `.atm`. The escape hatch when this happens is a **neighbour warmstart** — pre-stage a converged neighbour cell's `.atm` as the initial guess for ATLAS, with the target's chemistry rewritten on top. See [`docs/user-guide/neighbour-warmstart.md`](docs/user-guide/neighbour-warmstart.md) for the recipe.
+In a narrow corner — cool ($T_{\rm eff} \lesssim 4500$ K), low-gravity ($\log g = 0$) atmospheres with non-zero `--am` and small `--abund C:` perturbations — the kurucz-a1 emulator's prior is far enough from the true converged solution that ATLAS iterates into all-NaN before recovering. Defensive guards catch the failure cleanly with a `RuntimeError` rather than silently writing a degenerate `.atm`. The escape hatch when this happens is a **neighbour warmstart** — pre-stage a converged neighbour cell's `.atm` as the initial guess for ATLAS, with the target's chemistry rewritten on top. See [`docs/user-guide/neighbour-warmstart.md`](docs/user-guide/neighbour-warmstart.md) for the recipe.
 
 ## Documentation
 

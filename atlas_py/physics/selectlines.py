@@ -27,6 +27,12 @@ from pathlib import Path
 from typing import Sequence
 
 import numpy as np
+try:
+    import numba
+    _NUMBA_AVAILABLE = True
+except Exception:  # pragma: no cover - optional optimization dependency
+    numba = None
+    _NUMBA_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +48,12 @@ _MOLCODES: tuple[int, ...] = (
     8692, 8693, 8700, 8701, 8702, 8703, 8704, 8705, 8890, 8891, 8892,
     8896, 8960,
 )
+_MOLCODES_ARR = np.asarray(_MOLCODES, dtype=np.int32)
+_MOLCODE_LUT_MIN = int(np.min(_MOLCODES_ARR))
+_MOLCODE_LUT_MAX = int(np.max(_MOLCODES_ARR))
+_MOLCODE_TO_IMOL_LUT = np.zeros(_MOLCODE_LUT_MAX - _MOLCODE_LUT_MIN + 1, dtype=np.int32)
+for _k, _mc in enumerate(_MOLCODES_ARR):
+    _MOLCODE_TO_IMOL_LUT[int(_mc) - _MOLCODE_LUT_MIN] = np.int32(_k)
 
 # Isotope log(gf) offsets for diatomic molecules (atlas12.for lines 14643-14733)
 _ISOX: tuple[int, ...] = (
@@ -92,7 +104,131 @@ _ISOX: tuple[int, ...] = (
     -2690 + -35,     # 28Si18O
     -1 + -1,         # 51V16O (note: ISOX(46) in Fortran uses -001-001 which is -(1)-(1)=-2)
 )
+_ISOX_ARR = np.asarray(_ISOX, dtype=np.int32)
+_TIO_OFFSETS = np.asarray([-1101, -1138, -131, -1259, -1272], dtype=np.int32)
 
+if _NUMBA_AVAILABLE:
+    @numba.njit(cache=True, parallel=True)
+    def _compute_xnfdopmax_nb(xnfdop: np.ndarray, tabcont: np.ndarray) -> np.ndarray:
+        nrhox, mion = xnfdop.shape
+        _, n344 = tabcont.shape
+        out = np.zeros((mion, n344), dtype=np.float32)
+        for ion in numba.prange(mion):
+            for nu in range(n344):
+                vmax = np.float32(0.0)
+                for j in range(nrhox):
+                    tc = tabcont[j, nu]
+                    if tc > 0.0:
+                        val = np.float32(xnfdop[j, ion] / tc)
+                        if val > vmax:
+                            vmax = val
+                out[ion, nu] = vmax
+        return out
+
+    @numba.njit(cache=True, parallel=True)
+    def _select_lines_nb(
+        igflog_clipped: np.ndarray,
+        ielo_clipped: np.ndarray,
+        nu_arr: np.ndarray,
+        nelion_arr: np.ndarray,
+        tablog: np.ndarray,
+        xnfdopmax: np.ndarray,
+        freq4_per_bin: np.ndarray,
+        hckt_deepest: float,
+        xnf_min: float,
+    ) -> np.ndarray:
+        n = igflog_clipped.shape[0]
+        mask = np.empty(n, dtype=np.bool_)
+        for i in numba.prange(n):
+            nu = nu_arr[i]
+            xnf = xnfdopmax[nelion_arr[i], nu]
+            if xnf <= xnf_min:
+                mask[i] = False
+                continue
+            f4 = freq4_per_bin[nu]
+            if f4 <= 0.0:
+                f4 = np.float32(1.0e-37)
+            cr = np.float32(0.014999) * np.float32(tablog[igflog_clipped[i]]) * xnf / f4
+            if cr < 1.0:
+                mask[i] = False
+                continue
+            mask[i] = cr * np.exp(-np.float32(tablog[ielo_clipped[i]]) * np.float32(hckt_deepest)) >= 1.0
+        return mask
+
+    @numba.njit(cache=True, parallel=False)
+    def _unpack_clip_select_nb(
+        words: np.ndarray,
+        nu_raw: np.ndarray,
+        tablog: np.ndarray,
+        xnfdopmax: np.ndarray,
+        freq4_per_bin: np.ndarray,
+        hckt_deepest: float,
+        xnf_min: float,
+        xnfdopmax_mion: int,
+        n344: int,
+        nu_floor: int,
+        nelion_override_0b: int,
+        igflog_offset: np.ndarray,
+        has_igflog_offset: bool,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        n = words.shape[0]
+        mask = np.empty(n, dtype=np.bool_)
+        nu_arr = np.empty(n, dtype=np.int32)
+        nu_cur = nu_floor
+        for i in range(n):
+            nu_i = nu_raw[i]
+            if nu_i < nu_cur:
+                nu_i = nu_cur
+            if nu_i >= n344:
+                nu_i = n344 - 1
+            elif nu_i < 0:
+                nu_i = 0
+            nu_cur = nu_i
+            nu_arr[i] = nu_i
+
+            w1u = np.uint32(words[i, 1])
+            w2u = np.uint32(words[i, 2])
+            ielion = np.int16(w1u & np.uint32(0xFFFF))
+            ielo = np.int16((w1u >> np.uint32(16)) & np.uint32(0xFFFF))
+            igflog = np.int16(w2u & np.uint32(0xFFFF))
+
+            if nelion_override_0b >= 0:
+                nelion = nelion_override_0b
+            else:
+                nelion = abs(int(ielion)) // 10 - 1
+                if nelion < 0:
+                    nelion = 0
+                if nelion >= xnfdopmax_mion:
+                    nelion = xnfdopmax_mion - 1
+
+            kgf = int(igflog)
+            if has_igflog_offset:
+                kgf = kgf + int(igflog_offset[i])
+            if kgf < 1:
+                kgf = 1
+            kgf_idx = kgf - 1
+            if kgf_idx >= tablog.shape[0]:
+                kgf_idx = tablog.shape[0] - 1
+
+            xnf = xnfdopmax[nelion, nu_i]
+            if xnf <= xnf_min:
+                mask[i] = False
+                continue
+            f4 = freq4_per_bin[nu_i]
+            if f4 <= 0.0:
+                f4 = np.float32(1.0e-37)
+            cr = np.float32(0.014999) * np.float32(tablog[kgf_idx]) * xnf / f4
+            if cr < 1.0:
+                mask[i] = False
+                continue
+
+            ielo_idx = int(ielo) - 1
+            if ielo_idx < 0:
+                ielo_idx = 0
+            if ielo_idx >= tablog.shape[0]:
+                ielo_idx = tablog.shape[0] - 1
+            mask[i] = cr * np.exp(-np.float32(tablog[ielo_idx]) * np.float32(hckt_deepest)) >= 1.0
+        return mask, nu_arr
 
 def _build_tablog() -> np.ndarray:
     """TABLOG(32768) = 10^((i - 16384) * 0.001), i = 1..32768."""
@@ -137,6 +273,11 @@ def compute_xnfdopmax(
     """
     nrhox, mion = xnfdop.shape
     _, n344 = tabcont.shape
+    if _NUMBA_AVAILABLE:
+        return _compute_xnfdopmax_nb(
+            np.asarray(xnfdop, dtype=np.float32),
+            np.asarray(tabcont, dtype=np.float32),
+        )
     tabcont_safe = np.where(tabcont > 0.0, tabcont, np.inf)
     xnfdopmax = np.empty((mion, n344), dtype=np.float32)
     for nu in range(n344):
@@ -152,12 +293,33 @@ def _read_fixed_records(path: Path) -> np.ndarray:
     Each record is exactly 4 × 4-byte words = 16 bytes, with no Fortran
     record-length markers. Returns shape (N, 4) int32.
     """
+    import os
+
+    use_mmap = os.environ.get("ATLAS_SELECTLINES_MMAP", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+    if use_mmap and path.stat().st_size >= 16 * 1024 * 1024:
+        return _read_fixed_records_mmap(path)
     raw = np.fromfile(path, dtype=np.int32)
     if raw.size % 4 != 0:
         raise ValueError(
             f"{path}: word count {raw.size} not a multiple of 4."
         )
     return raw.reshape(-1, 4)
+
+
+def _read_fixed_records_mmap(path: Path) -> np.ndarray:
+    """Memory-map a fixed-record catalog and return a (N, 4) int32 view."""
+    n_bytes = path.stat().st_size
+    if n_bytes % 16 != 0:
+        raise ValueError(f"{path}: file size {n_bytes} not a multiple of 16 bytes.")
+    mm = np.memmap(path, dtype=np.int32, mode="r")
+    if mm.size % 4 != 0:
+        raise ValueError(f"{path}: mmap word count {mm.size} not a multiple of 4.")
+    return mm.reshape(-1, 4)
 
 
 def _read_sequential_16byte_records(path: Path) -> np.ndarray:
@@ -230,6 +392,7 @@ def _process_standard_catalog(
     xnf_min: float = 0.0,
     igs_override: int | None = None,
     igw_override: int | None = None,
+    freq4_per_bin: np.ndarray | None = None,
     output: io.RawIOBase,
 ) -> tuple[int, int]:
     """Process a single standard-format line catalog and write selected records.
@@ -260,20 +423,13 @@ def _process_standard_catalog(
     """
     n344 = iwavetab.shape[0]
     n_lines = words.shape[0]
-    iwl, ielion, ielo, igflog, igr, igs, igw = _unpack_iiiiiii(words)
-    iwl = iwl.astype(np.int64)
-    ielion_i32 = ielion.astype(np.int32)
-    ielo_i32 = ielo.astype(np.int32)
-    igflog_i32 = igflog.astype(np.int32)
+    iwl_i64 = words[:, 0].astype(np.int64)
 
-    if igflog_offset_array is not None:
-        igflog_i32 = np.maximum(igflog_i32 + igflog_offset_array, 1)
-
-    # Build NELION for each line (1-based index into xnfdopmax)
-    if nelion_override is not None:
-        nelion_arr = np.full(n_lines, nelion_override - 1, dtype=np.int32)  # 0-based
-    else:
-        nelion_arr = (np.abs(ielion_i32) // 10 - 1).clip(0, xnfdopmax.shape[0] - 1)
+    need_repack = (
+        igflog_offset_array is not None
+        or igs_override is not None
+        or igw_override is not None
+    )
 
     # Determine frequency bin NU for each line using sorted iwavetab
     # IWL < IWAVETAB(NU) means the line is in bin NU-1 (0-based: bin nu_0-based)
@@ -283,59 +439,126 @@ def _process_standard_catalog(
     # This is equivalent to: nu = np.searchsorted(iwavetab, iwl, side='right') - 1
     # IWAVETAB includes the sentinel at index 344 in Fortran (0-based: 343).
     # Keep that terminal bin reachable for exact parity.
-    nu_arr = np.searchsorted(iwavetab, iwl, side='right')  # 0-based NU index
-    nu_arr = np.clip(nu_arr, 0, n344 - 1)
-    if nu_floor > 0:
-        nu_arr = np.maximum(nu_arr, int(nu_floor))
-    # Fortran advances NU monotonically and never decreases within a catalog pass.
-    nu_arr = np.maximum.accumulate(nu_arr)
+    nu_raw = np.searchsorted(iwavetab, iwl_i64, side='right').astype(np.int32)
 
-    # Clip table indices
-    igflog_clipped = np.clip(igflog_i32 - 1, 0, len(tablog) - 1)
-    ielo_clipped = np.clip(ielo_i32 - 1, 0, len(tablog) - 1)
+    if freq4_per_bin is None:
+        wavetab_from_i = np.exp(iwavetab * _RATIOLG).astype(np.float64)
+        wavetab_from_i = np.where(wavetab_from_i > 0, wavetab_from_i, 1e-300)
+        freq4_per_bin = (2.99792458e17 / wavetab_from_i).astype(np.float32)
 
-    # FREQ4 from WAVETAB is not stored; we use precomputed from SELECTLINES inline.
-    # In Fortran: FREQ4 = 2.99792458e17 / WAVETAB(NU)
-    # We reconstruct from iwavetab: WAVETAB = EXP(IWAVETAB * RATIOLG)
-    # But WAVETAB is already in the Python waveset. We need FREQ4 per bin.
-    # For efficiency, precompute freq4 per bin from iwavetab.
-    wavetab_from_i = np.exp(iwavetab * _RATIOLG).astype(np.float64)
-    wavetab_from_i = np.where(wavetab_from_i > 0, wavetab_from_i, 1e-300)
-    freq4_per_bin = (2.99792458e17 / wavetab_from_i).astype(np.float32)
+    if _NUMBA_AVAILABLE and not need_repack:
+        iwl, ielion, ielo, igflog, _, _, _ = _unpack_iiiiiii(words)
+        ielion_i32 = ielion.astype(np.int32, copy=False)
+        ielo_i32 = ielo.astype(np.int32, copy=False)
+        igflog_i32 = igflog.astype(np.int32, copy=False)
 
-    # Gather per-line arrays
-    freq4 = freq4_per_bin[nu_arr]
-    tlog_gf = tablog[igflog_clipped].astype(np.float32)
-    tlog_elo = tablog[ielo_clipped].astype(np.float32)
-    xnfdopmax_line = xnfdopmax[nelion_arr, nu_arr]
+        if nelion_override is not None:
+            nelion_arr = np.full(n_lines, nelion_override - 1, dtype=np.int32)
+        else:
+            nelion_arr = (np.abs(ielion_i32) // 10 - 1).clip(0, xnfdopmax.shape[0] - 1)
 
-    # CENRATIO computation
-    denom = np.where(freq4 > 0, freq4, 1e-37)
-    cenratio = _CGF_SCALE * tlog_gf * xnfdopmax_line / denom
+        nu_arr = np.clip(nu_raw, 0, n344 - 1)
+        if nu_floor > 0:
+            nu_arr = np.maximum(nu_arr, int(nu_floor))
+        nu_arr = np.maximum.accumulate(nu_arr)
 
-    # Selection criteria
-    # 1. xnfdopmax > threshold (skip if essentially zero)
-    valid_xnf = xnfdopmax_line > np.float32(xnf_min)
-    # 2. CENRATIO >= 1.0
-    valid_cr1 = cenratio >= 1.0
-    # 3. CENRATIO * exp(-TABLOG[IELO] * HCKT[NRHOX-1]) >= 1.0
-    exp_factor = np.exp(-tlog_elo * np.float32(hckt_deepest))
-    valid_cr2 = cenratio * exp_factor >= 1.0
+        igflog_clipped = np.clip(igflog_i32 - 1, 0, len(tablog) - 1).astype(np.int32, copy=False)
+        ielo_clipped = np.clip(ielo_i32 - 1, 0, len(tablog) - 1).astype(np.int32, copy=False)
 
-    selected = valid_xnf & valid_cr1 & valid_cr2
-    sel_idx = np.where(selected)[0]
+        selected = _select_lines_nb(
+            np.ascontiguousarray(igflog_clipped, dtype=np.int32),
+            np.ascontiguousarray(ielo_clipped, dtype=np.int32),
+            np.ascontiguousarray(nu_arr, dtype=np.int32),
+            np.ascontiguousarray(nelion_arr, dtype=np.int32),
+            np.asarray(tablog, dtype=np.float64),
+            np.asarray(xnfdopmax, dtype=np.float32),
+            np.asarray(freq4_per_bin, dtype=np.float32),
+            float(hckt_deepest),
+            float(xnf_min),
+        )
+        sel_idx = np.where(selected)[0]
+        nu_end = int(nu_arr[-1]) if nu_arr.size > 0 else int(nu_floor)
+    elif _NUMBA_AVAILABLE:
+        iwl, ielion, ielo, igflog, igr, igs, igw = _unpack_iiiiiii(words)
+        ielion_i32 = ielion.astype(np.int32)
+        ielo_i32 = ielo.astype(np.int32)
+        igflog_i32 = igflog.astype(np.int32)
 
-    need_repack = (
-        igflog_offset_array is not None
-        or igs_override is not None
-        or igw_override is not None
-    )
+        if igflog_offset_array is not None:
+            igflog_i32 = np.maximum(igflog_i32 + igflog_offset_array, 1)
+
+        if nelion_override is not None:
+            nelion_arr = np.full(n_lines, nelion_override - 1, dtype=np.int32)
+        else:
+            nelion_arr = (np.abs(ielion_i32) // 10 - 1).clip(0, xnfdopmax.shape[0] - 1)
+
+        nu_arr = np.clip(nu_raw, 0, n344 - 1)
+        if nu_floor > 0:
+            nu_arr = np.maximum(nu_arr, int(nu_floor))
+        nu_arr = np.maximum.accumulate(nu_arr)
+
+        igflog_clipped = np.clip(igflog_i32 - 1, 0, len(tablog) - 1).astype(np.int32, copy=False)
+        ielo_clipped = np.clip(ielo_i32 - 1, 0, len(tablog) - 1).astype(np.int32, copy=False)
+
+        selected = _select_lines_nb(
+            np.ascontiguousarray(igflog_clipped, dtype=np.int32),
+            np.ascontiguousarray(ielo_clipped, dtype=np.int32),
+            np.ascontiguousarray(nu_arr, dtype=np.int32),
+            np.ascontiguousarray(nelion_arr, dtype=np.int32),
+            np.asarray(tablog, dtype=np.float64),
+            np.asarray(xnfdopmax, dtype=np.float32),
+            np.asarray(freq4_per_bin, dtype=np.float32),
+            float(hckt_deepest),
+            float(xnf_min),
+        )
+        sel_idx = np.where(selected)[0]
+        nu_end = int(nu_arr.max()) if nu_arr.size > 0 else int(nu_floor)
+    else:
+        iwl, ielion, ielo, igflog, igr, igs, igw = _unpack_iiiiiii(words)
+        ielion_i32 = ielion.astype(np.int32)
+        ielo_i32 = ielo.astype(np.int32)
+        igflog_i32 = igflog.astype(np.int32)
+
+        if igflog_offset_array is not None:
+            igflog_i32 = np.maximum(igflog_i32 + igflog_offset_array, 1)
+
+        if nelion_override is not None:
+            nelion_arr = np.full(n_lines, nelion_override - 1, dtype=np.int32)
+        else:
+            nelion_arr = (np.abs(ielion_i32) // 10 - 1).clip(0, xnfdopmax.shape[0] - 1)
+
+        nu_arr = np.clip(nu_raw, 0, n344 - 1)
+        if nu_floor > 0:
+            nu_arr = np.maximum(nu_arr, int(nu_floor))
+        nu_arr = np.maximum.accumulate(nu_arr)
+
+        igflog_clipped = np.clip(igflog_i32 - 1, 0, len(tablog) - 1).astype(np.int32, copy=False)
+        ielo_clipped = np.clip(ielo_i32 - 1, 0, len(tablog) - 1).astype(np.int32, copy=False)
+
+        freq4 = freq4_per_bin[nu_arr]
+        tlog_gf = tablog[igflog_clipped].astype(np.float32)
+        tlog_elo = tablog[ielo_clipped].astype(np.float32)
+        xnfdopmax_line = xnfdopmax[nelion_arr, nu_arr]
+        denom = np.where(freq4 > 0, freq4, 1e-37)
+        cenratio = _CGF_SCALE * tlog_gf * xnfdopmax_line / denom
+        valid_xnf = xnfdopmax_line > np.float32(xnf_min)
+        valid_cr1 = cenratio >= 1.0
+        exp_factor = np.exp(-tlog_elo * np.float32(hckt_deepest))
+        valid_cr2 = cenratio * exp_factor >= 1.0
+        sel_idx = np.where(valid_xnf & valid_cr1 & valid_cr2)[0]
+        nu_end = int(nu_arr.max()) if nu_arr.size > 0 else int(nu_floor)
 
     if not need_repack:
-        for i in sel_idx:
-            output.write(words[i].tobytes())
+        if sel_idx.size:
+            output.write(np.ascontiguousarray(words[sel_idx]).tobytes())
     else:
+        iwl, ielion, ielo, igflog, igr, igs, igw = _unpack_iiiiiii(words)
         iwl_i32 = iwl.astype(np.int32, copy=False)
+        ielion_i32 = ielion.astype(np.int32, copy=False)
+        ielo_i32 = ielo.astype(np.int32, copy=False)
+        igflog_i32 = igflog.astype(np.int32, copy=False)
+        if igflog_offset_array is not None:
+            igflog_i32 = np.maximum(igflog_i32 + igflog_offset_array, 1)
         igr_i32 = igr.astype(np.int32, copy=False)
         igs_i32 = np.full(n_lines, igs_override if igs_override is not None else 0, dtype=np.int32)
         if igs_override is None:
@@ -343,20 +566,18 @@ def _process_standard_catalog(
         igw_i32 = np.full(n_lines, igw_override if igw_override is not None else 0, dtype=np.int32)
         if igw_override is None:
             igw_i32 = igw.astype(np.int32, copy=False)
-
-        for i in sel_idx:
-            buf = np.zeros(4, dtype=np.int32)
-            buf[0] = int(iwl_i32[i])
-            s16 = buf[1:4].view(np.int16)
-            s16[0] = np.int16(int(ielion_i32[i]))
-            s16[1] = np.int16(int(ielo_i32[i]))
-            s16[2] = np.int16(int(igflog_i32[i]))
-            s16[3] = np.int16(int(igr_i32[i]))
-            s16[4] = np.int16(int(igs_i32[i]))
-            s16[5] = np.int16(int(igw_i32[i]))
+        if sel_idx.size:
+            buf = np.zeros((sel_idx.size, 4), dtype=np.int32)
+            buf[:, 0] = iwl_i32[sel_idx]
+            s16 = buf[:, 1:4].view(np.int16).reshape(-1, 6)
+            s16[:, 0] = ielion_i32[sel_idx].astype(np.int16)
+            s16[:, 1] = ielo_i32[sel_idx].astype(np.int16)
+            s16[:, 2] = igflog_i32[sel_idx].astype(np.int16)
+            s16[:, 3] = igr_i32[sel_idx].astype(np.int16)
+            s16[:, 4] = igs_i32[sel_idx].astype(np.int16)
+            s16[:, 5] = igw_i32[sel_idx].astype(np.int16)
             output.write(buf.tobytes())
 
-    nu_end = int(nu_arr.max()) if nu_arr.size > 0 else int(nu_floor)
     return int(sel_idx.size), nu_end
 
 
@@ -370,6 +591,7 @@ def _process_h2o_catalog(
     igs_fixed: int,
     igw_fixed: int,
     gammar_coeff: float,
+    freq4_per_bin: np.ndarray | None = None,
     output: io.RawIOBase,
 ) -> int:
     """Process the H2O line catalog (RECL=2 format, 3 int16 per record).
@@ -411,9 +633,10 @@ def _process_h2o_catalog(
     # Mirror Fortran loop state: NU only increments within the H2O pass.
     nu_arr = np.maximum.accumulate(nu_arr)
 
-    wavetab_from_i = np.exp(iwavetab * _RATIOLG).astype(np.float64)
-    wavetab_from_i = np.where(wavetab_from_i > 0, wavetab_from_i, 1e-300)
-    freq4_per_bin = (2.99792458e17 / wavetab_from_i).astype(np.float32)
+    if freq4_per_bin is None:
+        wavetab_from_i = np.exp(iwavetab * _RATIOLG).astype(np.float64)
+        wavetab_from_i = np.where(wavetab_from_i > 0, wavetab_from_i, 1e-300)
+        freq4_per_bin = (2.99792458e17 / wavetab_from_i).astype(np.float32)
 
     freq4 = freq4_per_bin[nu_arr]
     tlog_gf = tablog[np.clip(gflog_adj - 1, 0, len(tablog) - 1)].astype(np.float32)
@@ -435,28 +658,34 @@ def _process_h2o_catalog(
     # IWL as int32, then IELION/IELO/IGFLOG/IGR/IGS/IGW as int16.
     # IELO = int(log10(ELO)*1000 + 16384.5) (atlas12.for line 14871)
     # IGR computed from GAMMAR_COEFF (atlas12.for line 14838-14839)
-    count = 0
-    for i in sel_idx:
-        nu_i = int(nu_arr[i])
-        freq4_i = float(freq4[i])
-        gammar_i = gammar_coeff * (freq4_i ** 2) * 0.001
-        gr_i = max(1, min(32768, int(math.log10(max(gammar_i, 1e-300)) * 1000.0 + 16384.5)))
-        ielo_enc = max(1, min(32768, int(math.log10(max(float(elo[i]), 1e-300)) * 1000.0 + 16384.5)))
-        igf_i = int(gflog_adj[i])
-        iel_i = int(ielion_arr[i])
-        buf = np.zeros(4, dtype=np.int32)
-        buf[0] = int(iwl_raw[i])
-        s16 = buf[1:4].view(np.int16)
-        s16[0] = np.int16(iel_i)
-        s16[1] = np.int16(ielo_enc)
-        s16[2] = np.int16(igf_i)
-        s16[3] = np.int16(gr_i)
-        s16[4] = np.int16(igs_fixed)
-        s16[5] = np.int16(igw_fixed)
-        output.write(buf.tobytes())
-        count += 1
+    if sel_idx.size == 0:
+        return 0
 
-    return count
+    freq4_sel = freq4[sel_idx].astype(np.float64, copy=False)
+    gammar_arr = gammar_coeff * (freq4_sel * freq4_sel) * 0.001
+    gr_arr = np.clip(
+        (np.log10(np.maximum(gammar_arr, 1e-300)) * 1000.0 + 16384.5).astype(np.int64),
+        1,
+        32768,
+    ).astype(np.int32)
+    ielo_enc_arr = np.clip(
+        (np.log10(np.maximum(elo[sel_idx].astype(np.float64), 1e-300)) * 1000.0 + 16384.5).astype(np.int64),
+        1,
+        32768,
+    ).astype(np.int32)
+
+    buf = np.zeros((sel_idx.size, 4), dtype=np.int32)
+    buf[:, 0] = iwl_raw[sel_idx].astype(np.int32, copy=False)
+    s16 = buf[:, 1:4].view(np.int16).reshape(-1, 6)
+    s16[:, 0] = ielion_arr[sel_idx].astype(np.int16)
+    s16[:, 1] = ielo_enc_arr.astype(np.int16)
+    s16[:, 2] = gflog_adj[sel_idx].astype(np.int16)
+    s16[:, 3] = gr_arr.astype(np.int16)
+    s16[:, 4] = np.int16(igs_fixed)
+    s16[:, 5] = np.int16(igw_fixed)
+    output.write(buf.tobytes())
+
+    return int(sel_idx.size)
 
 
 def selectlines(
@@ -509,9 +738,11 @@ def selectlines(
     hckt_deepest = float(hckt[-1])
     mion = xnfdop.shape[1]
     iwavetab_i64 = np.asarray(iwavetab, dtype=np.int64)
+    wavetab_from_i = np.exp(iwavetab_i64 * _RATIOLG).astype(np.float64)
+    wavetab_from_i = np.where(wavetab_from_i > 0, wavetab_from_i, 1e-300)
+    freq4_per_bin = (2.99792458e17 / wavetab_from_i).astype(np.float32)
 
     counts = SelectionCounts()
-
     with open(fort12_output, "wb") as fout:
         # ----------------------------------------------------------------
         # LOWLINES (fort.11) – RECL=4 = 16 bytes/record
@@ -528,6 +759,7 @@ def selectlines(
                 hckt_deepest=hckt_deepest,
                 nu_floor=nu_after_lowlines,
                 xnf_min=1.0e-37,
+                freq4_per_bin=freq4_per_bin,
                 output=fout,
             )
             logger.info("SELECTLINES: %d lines from lowlines", counts.lowlines)
@@ -545,6 +777,7 @@ def selectlines(
                 xnfdopmax=xnfdopmax,
                 hckt_deepest=hckt_deepest,
                 xnf_min=1.0e-37,
+                freq4_per_bin=freq4_per_bin,
                 output=fout,
             )
             logger.info("SELECTLINES: %d lines from lowlines-obs", counts.lowlines_observed)
@@ -561,6 +794,7 @@ def selectlines(
                 tablog=tablog,
                 xnfdopmax=xnfdopmax,
                 hckt_deepest=hckt_deepest,
+                freq4_per_bin=freq4_per_bin,
                 output=fout,
             )
             logger.info("SELECTLINES: %d lines from hilines", counts.hilines)
@@ -574,14 +808,11 @@ def selectlines(
             logger.info("SELECTLINES: reading diatomics from %s", fort31_path)
             words = _read_sequential_16byte_records(fort31_path)
             if words.shape[0] > 0:
-                _, ielion_d, _, igflog_d, _, _, _ = _unpack_iiiiiii(words)
-                molcodes = np.array(_MOLCODES, dtype=np.int32)
-                isox_arr = np.array(_ISOX, dtype=np.int32)
+                _, ielion_d, _, _, _, _, _ = _unpack_iiiiiii(words)
                 molcode_arr = np.abs(ielion_d.astype(np.int32))
-                imol_arr = np.full(words.shape[0], 0, dtype=np.int32)
-                for k, mc in enumerate(molcodes):
-                    imol_arr[molcode_arr == mc] = k
-                igflog_offset = isox_arr[imol_arr]
+                idx = np.clip(molcode_arr - _MOLCODE_LUT_MIN, 0, _MOLCODE_TO_IMOL_LUT.size - 1)
+                imol_arr = _MOLCODE_TO_IMOL_LUT[idx]
+                igflog_offset = _ISOX_ARR[imol_arr]
                 counts.diatomics, _ = _process_standard_catalog(
                     words,
                     iwavetab=iwavetab_i64,
@@ -590,6 +821,7 @@ def selectlines(
                     hckt_deepest=hckt_deepest,
                     igflog_offset_array=igflog_offset,
                     igs_override=1,
+                    freq4_per_bin=freq4_per_bin,
                     output=fout,
                 )
             logger.info("SELECTLINES: %d lines from diatomics", counts.diatomics)
@@ -604,10 +836,9 @@ def selectlines(
             logger.info("SELECTLINES: reading TIO from %s", fort41_path)
             words = _read_fixed_records(fort41_path)
             if words.shape[0] > 0:
-                _, ielion_t, _, igflog_t, _, _, _ = _unpack_iiiiiii(words)
+                _, ielion_t, _, _, _, _, _ = _unpack_iiiiiii(words)
                 iso_t = (np.abs(ielion_t.astype(np.int32)) - 8949).clip(1, 5)
-                tio_offsets = np.array([-1101, -1138, -131, -1259, -1272], dtype=np.int32)
-                igflog_offset_tio = tio_offsets[iso_t - 1]
+                igflog_offset_tio = _TIO_OFFSETS[iso_t - 1]
                 counts.tio, _ = _process_standard_catalog(
                     words,
                     iwavetab=iwavetab_i64,
@@ -618,6 +849,7 @@ def selectlines(
                     igflog_offset_array=igflog_offset_tio,
                     igs_override=1,
                     igw_override=9384,
+                    freq4_per_bin=freq4_per_bin,
                     output=fout,
                 )
             logger.info("SELECTLINES: %d lines from TIO", counts.tio)
@@ -641,6 +873,7 @@ def selectlines(
                     igs_fixed=1,
                     igw_fixed=9384,
                     gammar_coeff=2.474e-22,
+                    freq4_per_bin=freq4_per_bin,
                     output=fout,
                 )
             logger.info("SELECTLINES: %d lines from H2O", counts.h2o)
@@ -666,6 +899,7 @@ def selectlines(
                     igflog_offset_array=igflog_offset_h3,
                     igs_override=1,
                     igw_override=9384,
+                    freq4_per_bin=freq4_per_bin,
                     output=fout,
                 )
             logger.info("SELECTLINES: %d lines from H3+", counts.h3plus)

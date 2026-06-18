@@ -4,6 +4,19 @@ This module provides a single canonical JIT-compiled implementation of the
 Voigt profile H(a,v) used throughout the synthesis pipeline.  All callers
 should import ``voigt_profile_jit`` from here instead of maintaining
 their own copy.
+
+``fastmath=True`` is enabled on the three FP-heavy kernels in this module
+(``accumulate_voigt_wings_jit``, ``accumulate_voigt_wings_and_source_jit``,
+``voigt_profile_jit``). These run with billions of inner iterations per
+SYNTHE pass; fastmath lets LLVM substitute reciprocal approximations for
+the per-step ``/doppler`` divide and FMA-fuse the Horner polynomial.
+Drift stays below ``float32`` storage precision (the ``wings_row`` /
+``sources_row`` accumulators that consume the values are float32 in the
+downstream radiative transfer). For a strict bit-exact reproducibility
+mode, gate these decorators behind an env-var override at the callsite.
+Notably ``_compute_transp_numba_kernel`` in ``line_opacity.py`` keeps
+``fastmath=False`` for its bitwise-reproducible policy. Fortran source
+analogue: synthe.for ACCWING / XLINOP wing accumulation.
 """
 
 from __future__ import annotations
@@ -13,7 +26,7 @@ import numpy as np
 from numba import jit, prange
 
 
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=True, fastmath=True)
 def accumulate_voigt_wings_jit(
     buffer: np.ndarray,
     continuum_row: np.ndarray,
@@ -143,7 +156,7 @@ def accumulate_voigt_wings_jit(
                 break
 
 
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=True, fastmath=True)
 def accumulate_voigt_wings_and_source_jit(
     wings_row: np.ndarray,
     sources_row: np.ndarray,
@@ -277,7 +290,7 @@ def accumulate_voigt_wings_and_source_jit(
             sources_row[idx] += value * bnu_row[idx]
 
 
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=True, fastmath=True)
 def voigt_profile_jit(
     v: float, a: float, h0tab: np.ndarray, h1tab: np.ndarray, h2tab: np.ndarray
 ) -> float:

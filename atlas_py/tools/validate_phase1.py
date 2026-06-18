@@ -30,12 +30,20 @@ def _default_kurucz_root() -> Path:
 
 
 def _ensure_gfpred_assembled(gfpred_bin: Path) -> None:
-    """Verify that gfpred29dec2014.bin is present; raise a helpful error if not."""
+    """Verify that gfpred29dec2014.bin is present; raise a helpful error if not.
+
+    The name is kept for backward compatibility with existing callers.
+    The file is distributed as a single binary via scripts/download_data.py
+    (pulled from Google Drive); the previous split-parts assembly is no
+    longer needed.
+    """
     if gfpred_bin.exists():
         return
     raise FileNotFoundError(
         f"Required atlas_py binary not found: {gfpred_bin}\n"
-        "Run `python scripts/download_data.py` to populate data/."
+        "Run `python scripts/download_data.py` to populate data/, or "
+        "`bash scripts/setup_data.sh --source /path/to/kurucz` if you have a "
+        "local Kurucz tree."
     )
 
 

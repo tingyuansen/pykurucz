@@ -1,14 +1,15 @@
 #!/usr/bin/env python
 """Synthesize a spectrum from a Kurucz .atm atmosphere file (Mode A).
 
-Two-step pipeline: atmosphere preprocessing -> spectrum synthesis.
+This is the Python replacement for run_python_pipeline.sh. It runs the
+two-step pipeline: atmosphere preprocessing -> spectrum synthesis.
 
 Usage:
     python synthesize_from_atm.py <atm_file> [--wl-start 300] [--wl-end 1800]
 
 Example:
-    python synthesize_from_atm.py path/to/your_model.atm
-    python synthesize_from_atm.py path/to/your_model.atm --wl-start 500 --wl-end 510
+    python synthesize_from_atm.py samples/at12_aaaaa_t08250g4.00.atm
+    python synthesize_from_atm.py samples/at12_aaaaa_t02500g-1.0.atm --wl-start 500 --wl-end 510
 """
 
 from __future__ import annotations

@@ -18,8 +18,7 @@ Fortran ATLAS12 (MOLECULES ON) — skipping it would silently diverge from
 Fortran parity and is therefore not offered as an option.
 
 This module also exposes the building blocks for the same flow as
-public helpers so that other tools (e.g. run_e2e_pipeline.py) can reuse them
-without duplicating the subprocess plumbing:
+public helpers so other scripts can reuse them without duplicating subprocess plumbing:
 
     emulator_warmstart_atm(...)  -> Path    # stellar params → warm-start .atm
     run_atlas_py(...)            -> Path    # warm-start .atm → iterated .atm
@@ -191,14 +190,16 @@ def parse_abund_arg(s: str) -> tuple[int, float]:
 def write_atm_file(path: Path, teff: float, logg: float,
                    data: np.ndarray, vturb: float,
                    mh: float = 0.0, am: float = 0.0,
-                   individual: Optional[Dict[int, float]] = None) -> None:
+                   individual: Optional[Dict[int, float]] = None,
+                   title: Optional[str] = None) -> None:
     """Write a Kurucz-format .atm file from emulator-predicted atmospheric structure."""
     abund = compute_abundances(mh, am, individual)
     h = compute_h(mh, am, individual)
 
     lines = []
     lines.append(f'TEFF   {teff:.0f}.  GRAVITY {logg:7.4f} LTE ')
-    lines.append('TITLE kurucz-a1 emulator (Li et al. 2025) + pyKurucz                               ')
+    title_text = title if title is not None else "kurucz-a1 emulator (Li et al. 2025) + pyKurucz"
+    lines.append(f'TITLE {title_text:<80}')
     lines.append(' OPACITY IFOP 1 1 1 1 1 1 1 1 1 1 1 1 1 0 1 0 1 0 0 0')
     lines.append(' CONVECTION ON   1.25 TURBULENCE OFF  0.00  0.00  0.00  0.00')
     lines.append(f'ABUNDANCE SCALE   1.00000 ABUNDANCE CHANGE 1 {h:.5f} 2 {HE_ABUNDANCE:.5f}')
@@ -255,9 +256,7 @@ def write_atm_file(path: Path, teff: float, logg: float,
 # ── Shared pipeline helpers ─────────────────────────────────────────────
 #
 # The three public helpers below are the canonical Python-pipeline building
-# blocks.  ``synthesize()`` chains them, and run_e2e_pipeline.py imports them
-# directly so that both user-facing and validation runs go through the exact
-# same code paths.
+# blocks.  ``synthesize()`` chains them for the user-facing CLI.
 
 _REPO_ROOT = Path(__file__).resolve().parent
 
@@ -267,11 +266,36 @@ def _default_kurucz_root() -> Path:
     return _REPO_ROOT / "data"
 
 
+def _default_atlas_cache_dir() -> Path:
+    """Disk cache for Python SELECTLINES (``fort.12``); shared with parity harness."""
+    return _REPO_ROOT / "results" / "atlas_fort12_cache"
+
+
+# Prod optimization defaults.  Applied via setdefault in child processes so an
+# setdefault in child processes so an explicit shell override still wins.
+_PROD_ENV_DEFAULTS: dict[str, str] = {
+    "ATLAS_LINOP1_CACHE_LINE_SCALARS": "1",
+    "ATLAS_LINOP1_PREFILTER": "1",
+    "ATLAS_LINOP1_TIGHT_PREFILTER": "1",
+    "ATLAS_LINOP1_SERIAL": "0",
+    "PY_USE_NUMBA_TRANSP": "1",
+    "PY_NUMBA_HELIUM": "1",
+    "PY_OPT_STEP1_WING_HOIST": "1",
+    "PY_HYD_JIT": "1",
+}
+
+
+def _apply_prod_env_defaults(env: dict[str, str]) -> None:
+    for key, value in _PROD_ENV_DEFAULTS.items():
+        env.setdefault(key, value)
+
+
 def _run_streaming(
     cmd: list[str],
     *,
     cwd: Optional[Path] = None,
     log_handle=None,
+    env_overrides: Optional[dict[str, str]] = None,
 ) -> None:
     """Stream merged stdout/stderr from *cmd* into *log_handle* line-by-line.
 
@@ -280,6 +304,9 @@ def _run_streaming(
     """
     env = {**os.environ}
     env.setdefault("PYTHONUNBUFFERED", "1")
+    _apply_prod_env_defaults(env)
+    if env_overrides:
+        env.update(env_overrides)
     proc = subprocess.Popen(
         cmd,
         text=True,
@@ -336,6 +363,29 @@ def emulator_warmstart_atm(
     emulator = load_emulator()
     data_9col = emulator.predict_atmosphere_data(teff, logg, eff_mh, eff_am, vturb)
     dest.parent.mkdir(parents=True, exist_ok=True)
+
+    t_col = data_9col[:, 1]
+    rhox_col = data_9col[:, 0]
+    bad_t = np.any(t_col <= 0.0) or np.any(~np.isfinite(t_col))
+    bad_rhox = np.any(rhox_col <= 0.0) or np.any(~np.isfinite(rhox_col))
+    if bad_t or bad_rhox:
+        from atlas_py.physics.grey_start import write_grey_atm_file
+
+        write_grey_atm_file(
+            dest,
+            teff=teff,
+            logg=logg,
+            mh=mh,
+            am=am,
+            abundances=abundances,
+            vturb_kms=vturb,
+            title=(
+                f"grey fallback (emulator had non-positive T/RHOX) "
+                f"Teff={teff:.0f} logg={logg:.2f}"
+            ),
+        )
+        return dest
+
     write_atm_file(
         dest, teff, logg, data_9col, vturb,
         mh=mh, am=am, individual=abundances,
@@ -354,6 +404,8 @@ def run_atlas_py(
     convergence_epsilon: Optional[float] = None,
     convergence_min_iterations: int = 5,
     convergence_consecutive: int = 1,
+    n_workers: Optional[int] = None,
+    cache_dir: Optional[Path] = None,
 ) -> Path:
     """Run ``atlas_py.cli`` on *input_atm* and write iterated output to *output_atm*.
 
@@ -433,6 +485,10 @@ def run_atlas_py(
         )
     if fort12_bin is not None and fort12_bin.exists():
         cmd.extend(["--line-selection-bin", str(fort12_bin)])
+    if cache_dir is not None:
+        cmd.extend(["--cache-dir", str(cache_dir)])
+    if n_workers is not None:
+        cmd.extend(["--n-workers", str(n_workers)])
 
     with log_path.open("w", encoding="utf-8") as logf:
         logf.write(
@@ -470,6 +526,8 @@ def run_synthe_py(
     use_molecular_lines: bool = True,
     include_tio: bool = True,
     include_h2o: bool = True,
+    npz_cache: bool = True,
+    npz_cache_dir: Optional[Path] = None,
 ) -> Path:
     """Convert *atm* to NPZ and run ``synthe_py.cli`` to produce *spec*.
 
@@ -497,7 +555,36 @@ def run_synthe_py(
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     cpu = os.cpu_count() or 1
-    workers = n_workers if n_workers is not None else cpu
+    thread_budget = n_workers if n_workers is not None else cpu
+
+    from atlas_py.engine.threading_policy import ThreadingPolicy
+
+    synthe_policy = ThreadingPolicy.for_synthe_grid(
+        thread_budget,
+        wl_start=wl_start,
+        wl_end=wl_end,
+        resolution=resolution,
+    )
+    synthe_env = synthe_policy.env_updates()
+
+    from synthe_py.tools.npz_cache import (
+        copy_cached_npz,
+        default_npz_cache_dir,
+        npz_cache_key,
+        resolve_cached_npz,
+        store_npz_cache,
+    )
+
+    converter_script = _REPO_ROOT / "synthe_py" / "tools" / "convert_atm_to_npz.py"
+    molecules_dat = _REPO_ROOT / "lines" / "molecules.dat"
+    cache_root = npz_cache_dir or default_npz_cache_dir(_REPO_ROOT)
+    cache_key = npz_cache_key(
+        atm_path=atm.resolve(),
+        atlas_tables=atlas_tables,
+        molecules=molecules_dat,
+        converter_script=converter_script,
+    )
+    cached_npz = resolve_cached_npz(cache_root, cache_key)
 
     with log_path.open("w", encoding="utf-8") as logf:
         logf.write(
@@ -507,28 +594,41 @@ def run_synthe_py(
             f"  npz:  {npz}\n"
             f"  spec: {spec}\n"
             f"  wl:   {wl_start:.1f}–{wl_end:.1f} nm  R={resolution:.0f}  "
-            f"workers={workers}\n"
+            f"thread_budget={thread_budget} numba={synthe_policy.numba_threads} "
+            f"rt_pool={synthe_policy.rt_pool}\n"
+            f"  npz_cache={'on' if npz_cache else 'off'} key={cache_key[:16]}...\n"
             "======================================================================\n\n"
         )
         logf.flush()
 
         t0 = time.perf_counter()
-        logf.write("==== STEP: convert_atm_to_npz START ====\n"); logf.flush()
-        _run_streaming(
-            [
-                sys.executable, "-u",
-                str(_REPO_ROOT / "synthe_py" / "tools" / "convert_atm_to_npz.py"),
-                str(atm.resolve()),
-                str(npz.resolve()),
-                "--atlas-tables", str(atlas_tables.resolve()),
-            ],
-            cwd=_REPO_ROOT,
-            log_handle=logf,
-        )
-        logf.write(
-            f"==== STEP: convert_atm_to_npz END wall={time.perf_counter() - t0:.3f}s ====\n\n"
-        )
-        logf.flush()
+        if npz_cache and cached_npz.is_file():
+            logf.write("==== STEP: convert_atm_to_npz CACHE HIT ====\n")
+            logf.flush()
+            copy_cached_npz(cached_npz, npz)
+            logf.write(
+                f"==== STEP: convert_atm_to_npz END wall={time.perf_counter() - t0:.3f}s (cached) ====\n\n"
+            )
+            logf.flush()
+        else:
+            logf.write("==== STEP: convert_atm_to_npz START ====\n"); logf.flush()
+            _run_streaming(
+                [
+                    sys.executable, "-u",
+                    str(converter_script),
+                    str(atm.resolve()),
+                    str(npz.resolve()),
+                    "--atlas-tables", str(atlas_tables.resolve()),
+                ],
+                cwd=_REPO_ROOT,
+                log_handle=logf,
+            )
+            logf.write(
+                f"==== STEP: convert_atm_to_npz END wall={time.perf_counter() - t0:.3f}s ====\n\n"
+            )
+            logf.flush()
+            if npz_cache:
+                store_npz_cache(cache_root, cache_key, npz)
 
         cmd = [
             sys.executable, "-u", "-m", "synthe_py.cli",
@@ -539,7 +639,7 @@ def run_synthe_py(
             "--wl-start", str(wl_start),
             "--wl-end", str(wl_end),
             "--resolution", str(resolution),
-            "--n-workers", str(workers),
+            "--n-workers", str(thread_budget),
             "--log-level", "INFO",
         ]
         mol_dir = root / "molecules"
@@ -555,7 +655,7 @@ def run_synthe_py(
 
         t1 = time.perf_counter()
         logf.write("==== STEP: synthe_py.cli START ====\n"); logf.flush()
-        _run_streaming(cmd, cwd=_REPO_ROOT, log_handle=logf)
+        _run_streaming(cmd, cwd=_REPO_ROOT, log_handle=logf, env_overrides=synthe_env)
         logf.write(
             f"==== STEP: synthe_py.cli END wall={time.perf_counter() - t1:.3f}s ====\n"
         )
@@ -585,7 +685,14 @@ def synthesize(
     atlas_convergence_min_iterations: int = 5,
     atlas_convergence_consecutive: int = 1,
     n_workers: Optional[int] = None,
+    atlas_fort12_cache: bool = True,
+    atlas_cache_dir: Optional[Path] = None,
     warmstart_atm_override: Optional[str] = None,
+    npz_cache: bool = True,
+    npz_cache_dir: Optional[Path] = None,
+    linop1_serial: Optional[bool] = None,
+    convec_fd_parallel: Optional[bool] = None,
+    pops_parallel: Optional[bool] = None,
 ) -> Path:
     """Generate a synthetic spectrum from stellar parameters.
 
@@ -630,13 +737,40 @@ def synthesize(
         Early-stop threshold on physical atmosphere column changes.  Defaults
         to 1e-3; set to None to force all ``atlas_iterations``.
     n_workers : int, optional
-        Worker count for synthe_py.cli (default: all logical CPUs).
+        Total CPU thread budget for the full pipeline.  Sets Numba
+        (LINOP1, metal wings, RT prange), ATLAS frequency-loop pool,
+        SYNTHE RT pool, and CONVEC FD pool (``min(4, N)``).  BLAS is
+        pinned to 1 thread to avoid oversubscription.  Default: all
+        logical CPUs.
+    atlas_fort12_cache : bool
+        When True (default), reuse a disk cache of Python SELECTLINES output
+        under ``results/atlas_fort12_cache/``.
+    atlas_cache_dir : Path, optional
+        Override directory for the fort.12 cache.  Ignored when
+        ``atlas_fort12_cache`` is False.
 
     Returns
     -------
     Path
         Path to the output ``.spec`` file.
     """
+    from atlas_py.engine.threading_policy import (
+        ThreadingPolicy,
+        estimate_wavelength_grid_size,
+        log_threading_banner,
+    )
+
+    base_policy = ThreadingPolicy.from_n_workers(
+        n_workers,
+        linop1_serial=linop1_serial,
+        convec_fd_parallel=convec_fd_parallel,
+        pops_parallel=pops_parallel,
+    )
+    n_wl = estimate_wavelength_grid_size(wl_start, wl_end, resolution)
+    policy = base_policy.adapt_for_grid(n_wl)
+    policy.apply()
+    log_threading_banner(policy, stage="synthesize")
+
     if output_dir is None:
         output_dir = str(_REPO_ROOT / "results")
     output_path = Path(output_dir)
@@ -736,8 +870,15 @@ def synthesize(
             sys.exit(1)
     print(f"      Warm-start: {warmstart_atm}")
 
+    cache_dir = None
+    if atlas_fort12_cache:
+        cache_dir = atlas_cache_dir or _default_atlas_cache_dir()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
     # ── Stage 2: atlas_py iteration ─────────────────────────────────────
     print(f"[2/3] Running atlas_py ({atlas_iterations} iteration(s), MOLECULES ON)...")
+    if cache_dir is not None:
+        print(f"      fort.12 cache: {cache_dir}")
     try:
         run_atlas_py(
             input_atm=warmstart_atm,
@@ -747,6 +888,8 @@ def synthesize(
             convergence_epsilon=atlas_convergence_epsilon,
             convergence_min_iterations=atlas_convergence_min_iterations,
             convergence_consecutive=atlas_convergence_consecutive,
+            n_workers=policy.atlas_freq_pool,
+            cache_dir=cache_dir,
         )
     except (FileNotFoundError, RuntimeError) as exc:
         print(f"ERROR in atlas_py: {exc}")
@@ -768,10 +911,12 @@ def synthesize(
             wl_start=wl_start,
             wl_end=wl_end,
             resolution=resolution,
-            n_workers=n_workers,
+            n_workers=policy.n_workers,
             use_molecular_lines=use_molecular_lines,
             include_tio=include_tio,
             include_h2o=include_h2o,
+            npz_cache=npz_cache,
+            npz_cache_dir=npz_cache_dir,
         )
     except (FileNotFoundError, RuntimeError) as exc:
         print(f"ERROR in synthe_py: {exc}. See log: {synthe_log}")
@@ -894,6 +1039,50 @@ Notes:
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Output directory (default: results/)")
     parser.add_argument(
+        "--n-workers",
+        type=int,
+        default=None,
+        help=(
+            "Total CPU thread budget for ATLAS + SYNTHE (Numba, freq pool, "
+            "RT pool, CONVEC FD). Default: all logical CPUs."
+        ),
+    )
+    parser.add_argument(
+        "--linop1-serial",
+        action="store_true",
+        help="Force serial LINOP1 (overrides auto parallel from --n-workers).",
+    )
+    parser.add_argument(
+        "--convec-fd-parallel",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable parallel CONVEC FD pool (default: on when n-workers>1).",
+    )
+    parser.add_argument(
+        "--pops-parallel",
+        action="store_true",
+        help="Enable parallel POPS/NELECT (default: off; can hurt e2e).",
+    )
+    parser.add_argument(
+        "--no-npz-cache",
+        action="store_true",
+        help="Disable convert_atm_to_npz disk cache.",
+    )
+    parser.add_argument(
+        "--atlas-cache-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory for fort.12 SELECTLINES disk cache "
+            f"(default: {_default_atlas_cache_dir()})."
+        ),
+    )
+    parser.add_argument(
+        "--no-atlas-cache",
+        action="store_true",
+        help="Disable fort.12 disk cache (rebuild SELECTLINES every run).",
+    )
+    parser.add_argument(
         "--warmstart-atm", type=str, default=None,
         help="Path to a pre-staged warm-start .atm file. When set, skip "
              "the kurucz-a1 emulator and use this file's layer structure "
@@ -933,6 +1122,8 @@ Notes:
     )
     if atlas_convergence_epsilon is not None and atlas_convergence_epsilon <= 0.0:
         parser.error("--atlas-convergence-epsilon must be positive")
+    if args.n_workers is not None and args.n_workers < 1:
+        parser.error("--n-workers must be >= 1")
 
     individual = None
     if args.abund:
@@ -956,7 +1147,18 @@ Notes:
         use_molecular_lines=not args.no_molecular_lines,
         include_tio=not args.no_tio,
         include_h2o=not args.no_h2o,
+        n_workers=args.n_workers,
+        atlas_fort12_cache=not args.no_atlas_cache,
+        atlas_cache_dir=(
+            Path(args.atlas_cache_dir).expanduser().resolve()
+            if args.atlas_cache_dir is not None
+            else None
+        ),
         warmstart_atm_override=args.warmstart_atm,
+        npz_cache=not args.no_npz_cache,
+        linop1_serial=True if args.linop1_serial else None,
+        convec_fd_parallel=args.convec_fd_parallel,
+        pops_parallel=True if args.pops_parallel else None,
     )
 
 
