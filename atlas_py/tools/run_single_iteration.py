@@ -9,6 +9,39 @@ import tempfile
 from pathlib import Path
 
 
+def _write_atlas_log(
+    log_path: Path | None,
+    *,
+    p1: subprocess.CompletedProcess[str],
+    p2: subprocess.CompletedProcess[str] | None,
+    label: str = "",
+) -> None:
+    if log_path is None:
+        return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    parts = []
+    if label:
+        parts.append(f"=== {label} ===\n")
+    parts.extend(
+        [
+            "=== PASS 1 STDOUT ===\n",
+            p1.stdout or "",
+            "\n=== PASS 1 STDERR ===\n",
+            p1.stderr or "",
+        ]
+    )
+    if p2 is not None:
+        parts.extend(
+            [
+                "\n=== PASS 2 STDOUT ===\n",
+                p2.stdout or "",
+                "\n=== PASS 2 STDERR ===\n",
+                p2.stderr or "",
+            ]
+        )
+    log_path.write_text("".join(parts), encoding="utf-8")
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Run atlas12.exe for one iteration")
     p.add_argument("--atlas12-exe", type=Path, required=True)
@@ -112,9 +145,18 @@ END
             input=deck1,
             text=True,
             cwd=work,
-            check=True,
             capture_output=True,
         )
+        if p1.returncode != 0:
+            _write_atlas_log(
+                args.log_path,
+                p1=p1,
+                p2=None,
+                label="pass 1 failed",
+            )
+            raise RuntimeError(
+                f"atlas12 pass 1 failed with exit {p1.returncode}"
+            )
         if not (work / "fort.12").exists():
             raise RuntimeError("atlas12 first pass did not produce fort.12")
         shutil.move(work / "fort.12", work / "tmp.bin")
@@ -137,9 +179,18 @@ END
             input=deck2,
             text=True,
             cwd=work,
-            check=True,
             capture_output=True,
         )
+        if p2.returncode != 0:
+            _write_atlas_log(
+                args.log_path,
+                p1=p1,
+                p2=p2,
+                label=f"pass 2 failed (exit {p2.returncode})",
+            )
+            raise RuntimeError(
+                f"atlas12 pass 2 failed with exit {p2.returncode}"
+            )
         if not (work / "fort.7").exists():
             # Some builds keep unit 7 preconnected to stdout. Try to recover
             # punched deck from stdout before failing.
@@ -157,22 +208,7 @@ END
 
         args.output_atm.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(work / "fort.7", args.output_atm)
-        if args.log_path is not None:
-            args.log_path.parent.mkdir(parents=True, exist_ok=True)
-            args.log_path.write_text(
-                (
-                    "=== PASS 1 STDOUT ===\n"
-                    + p1.stdout
-                    + "\n=== PASS 1 STDERR ===\n"
-                    + p1.stderr
-                    + "\n=== PASS 2 STDOUT ===\n"
-                    + p2.stdout
-                    + "\n=== PASS 2 STDERR ===\n"
-                    + p2.stderr
-                    + "\n"
-                ),
-                encoding="utf-8",
-            )
+        _write_atlas_log(args.log_path, p1=p1, p2=p2)
         if args.output_trace_csv is not None and (work / "atlas12_trace.csv").exists():
             args.output_trace_csv.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(work / "atlas12_trace.csv", args.output_trace_csv)

@@ -65,13 +65,6 @@ _CGF_SCALE = 0.026538 / 1.77245 / 2.99792458e17
 _GAMMA_SCALE = 1.0 / 12.5664 / 2.99792458e17
 _LINOP1_CHUNK_MIN_RECORDS = 500_000
 _LINOP1_CHUNK_TARGET = 250_000
-# profile_stats layout: [0]=lines [1]=prefilter_skip [2]=j0_outer [3]=inner7
-# [4]=wings [5..15]=active-stride-count histogram (0..10)
-# [16..25]=per-stride outer activation [26]=outer_wings [27]=inner_wings
-# [28]=stride_dead_skip (all 10 pre-fastex checks failed)
-# [29]=tight_stride_skip (per-stride fastex elided via boltz upper bound)
-_LINOP1_PROFILE_STATS_SIZE = 30
-_LINOP1_N_STRIDE_BANDS = 10
 
 _LO_TABLES = _load_lo_tables()
 _TABVI = _LO_TABLES["_TABVI"]
@@ -114,6 +107,40 @@ def _build_tablog() -> np.ndarray:
 def _build_exptab() -> tuple[np.ndarray, np.ndarray]:
     i = np.arange(1001, dtype=np.float64)
     return np.exp(-i), np.exp(-i * 0.001)
+
+
+@lru_cache(maxsize=1)
+def _build_exptab_f32() -> tuple[np.ndarray, np.ndarray]:
+    extab, extabf = _build_exptab()
+    return extab.astype(np.float32, copy=False), extabf.astype(np.float32, copy=False)
+
+
+@lru_cache(maxsize=1)
+def _build_tablog_f32() -> np.ndarray:
+    return np.asarray(_build_tablog(), dtype=np.float32)
+
+
+@lru_cache(maxsize=1)
+def _build_h_tables_f32() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    h0, h1, h2 = _build_h_tables()
+    return (
+        h0.astype(np.float32, copy=False),
+        h1.astype(np.float32, copy=False),
+        h2.astype(np.float32, copy=False),
+    )
+
+
+def _as_contiguous_f32(arr: np.ndarray) -> np.ndarray:
+    """Return C-contiguous float32 view without copy when possible."""
+    if arr.dtype == np.float32 and arr.flags.c_contiguous:
+        return arr
+    return np.ascontiguousarray(arr, dtype=np.float32)
+
+
+def _as_contiguous_f64(arr: np.ndarray) -> np.ndarray:
+    if arr.dtype == np.float64 and arr.flags.c_contiguous:
+        return arr
+    return np.ascontiguousarray(arr, dtype=np.float64)
 
 
 def _map4(xold: np.ndarray, fold: np.ndarray, xnew: np.ndarray) -> np.ndarray:
@@ -509,20 +536,32 @@ def _dummy_i64() -> np.ndarray:
 if _NUMBA_AVAILABLE:
     _njit = numba.njit(cache=True, nogil=True)
     _njit_parallel = numba.njit(cache=True, parallel=True, nogil=True)
+    # Inlined variant for the small LINOP1 lookup helpers (fastex/voigt). These
+    # are tiny and benefit from inlining at their many call sites; the larger
+    # wing accumulator is intentionally NOT force-inlined (it bloated the kernel
+    # and regressed throughput).
+    _njit_inline = numba.njit(cache=True, nogil=True, inline="always")
 
-    @_njit
+    @_njit_inline
     def _fastex_nb(x, extab, extabf):
+        # Returns float32 unconditionally. The Fortran EXP10 lookup is REAL*4,
+        # and the zero-branch must NOT leak a Python float (float64): doing so
+        # makes Numba unify _fastex_nb's return type to float64, which then
+        # poisons `center = center * _fastex_nb(...)` to float64 and forces the
+        # entire LINOP1 wing accumulator (~1.3B steps/iter on cool stars) into
+        # double precision with f32<->f64 conversions on every step. Keeping it
+        # float32 lets the wing path stay single-precision like Fortran.
         if x < 0.0 or x >= 1001.0:
-            return 0.0
+            return np.float32(0.0)
         i = int(x)
         j = int((x - float(i)) * 1000.0 + 1.5)
         if j < 1:
             j = 1
         if j > 1001:
             j = 1001
-        return extab[i] * extabf[j - 1]
+        return np.float32(extab[i] * extabf[j - 1])
 
-    @_njit
+    @_njit_inline
     def _voigt_nb(v, a, h0, h1, h2):
         iv = int(v * 200.0 + 1.5)
         if iv < 1:
@@ -582,7 +621,7 @@ if _NUMBA_AVAILABLE:
             for iw in range(nu0, ired_hi):
                 vvoigt = np.float32(waveset[iw] - wlvac) / dopwave
                 if vvoigt > np.float32(10.0):
-                    cv = center * f32_5642 * adamp / (vvoigt * vvoigt)
+                    cv = np.float32(center * f32_5642 * adamp / (vvoigt * vvoigt))
                 else:
                     iv = int(vvoigt * np.float32(200.0) + np.float32(1.5))
                     if iv < 1:
@@ -590,7 +629,7 @@ if _NUMBA_AVAILABLE:
                     if iv > 2001:
                         iv = 2001
                     ii = iv - 1
-                    cv = center * ((h2tab[ii] * adamp + h1tab[ii]) * adamp + h0tab[ii])
+                    cv = np.float32(center * ((h2tab[ii] * adamp + h1tab[ii]) * adamp + h0tab[ii]))
                 xlines[j0, iw] += cv
                 if cv < tabcont_ref:
                     break
@@ -600,7 +639,7 @@ if _NUMBA_AVAILABLE:
                     break
                 vvoigt = np.float32(wlvac - waveset[iw]) / dopwave
                 if vvoigt > np.float32(10.0):
-                    cv = center * f32_5642 * adamp / (vvoigt * vvoigt)
+                    cv = np.float32(center * f32_5642 * adamp / (vvoigt * vvoigt))
                 else:
                     iv = int(vvoigt * np.float32(200.0) + np.float32(1.5))
                     if iv < 1:
@@ -608,7 +647,7 @@ if _NUMBA_AVAILABLE:
                     if iv > 2001:
                         iv = 2001
                     ii = iv - 1
-                    cv = center * ((h2tab[ii] * adamp + h1tab[ii]) * adamp + h0tab[ii])
+                    cv = np.float32(center * ((h2tab[ii] * adamp + h1tab[ii]) * adamp + h0tab[ii]))
                 xlines[j0, iw] += cv
                 if cv < tabcont_ref:
                     break
@@ -626,6 +665,34 @@ if _NUMBA_AVAILABLE:
             xlines[j0, iw] += cv
             if cv < tabcont_ref:
                 break
+
+    @_njit
+    def _tab_col_min_nb(tab: np.ndarray) -> np.ndarray:
+        nrows = tab.shape[0]
+        ncols = tab.shape[1]
+        out = np.empty(ncols, dtype=np.float32)
+        for k in range(ncols):
+            m = tab[0, k]
+            for j in range(1, nrows):
+                v = tab[j, k]
+                if v < m:
+                    m = v
+            out[k] = m
+        return out
+
+    @_njit
+    def _max_xnfdop_col_nb(xnfdop_arr: np.ndarray) -> np.ndarray:
+        nrows = xnfdop_arr.shape[0]
+        ncols = xnfdop_arr.shape[1]
+        out = np.empty(ncols, dtype=np.float32)
+        for k in range(ncols):
+            m = xnfdop_arr[0, k]
+            for j in range(1, nrows):
+                v = xnfdop_arr[j, k]
+                if v > m:
+                    m = v
+            out[k] = m
+        return out
 
     @_njit
     def _accwings_cutoff_nb(
@@ -715,57 +782,6 @@ if _NUMBA_AVAILABLE:
         return peak < tab_col_min[nucont0]
 
     @_njit
-    def _linop1_all_stride_prefastex_dead_nb(
-        cgf,
-        nelion,
-        nucont0,
-        tab,
-        xnfdop_arr,
-        nrhox,
-    ):
-        """True when every stride-8 anchor fails the pre-Boltzmann center test.
-
-        Mirrors the first ``CENTER.LT.TABCONT(J,NUCONT)`` check at each
-        ``J=8,16,...,NRHOX`` in Fortran LINOP1 (atlas12.for ~10123). Exact-safe:
-        if all anchors fail this test, no stride can activate and IFJ stays zero.
-        """
-        nel = nelion - 1
-        for j1 in range(8, nrhox + 1, 8):
-            j0 = j1 - 1
-            if cgf * xnfdop_arr[j0, nel] >= tab[j0, nucont0]:
-                return False
-        return True
-
-    @_njit
-    def _linop1_all_stride_tight_dead_nb(
-        cgf,
-        nelion,
-        nucont0,
-        tab,
-        xnfdop_arr,
-        nrhox,
-        elo_val,
-        min_hckt,
-        extab,
-        extabf,
-    ):
-        """True when every stride anchor fails the tight post-Boltzmann upper bound.
-
-        Uses ``fastex(elo * min_hckt)`` as an upper bound on ``fastex(elo * hckt[j])``
-        at all layers (``_fastex`` decreases with ``hckt``). If
-        ``cgf * xnfdop[j0] * fastex(elo * min_hckt) < tab[j0, nucont0]`` at every
-        stride anchor, no depth can pass the post-Boltzmann center test either.
-        """
-        nel = nelion - 1
-        boltz_max = _fastex_nb(elo_val * min_hckt, extab, extabf)
-        for j1 in range(8, nrhox + 1, 8):
-            j0 = j1 - 1
-            peak = cgf * xnfdop_arr[j0, nel] * boltz_max
-            if peak >= tab[j0, nucont0]:
-                return False
-        return True
-
-    @_njit
     def _linop1_kernel_nb(
         n_records,
         iwl_arr, ielion_arr, ielo_arr, igflog_arr, igr_arr, igs_arr, igw_arr,
@@ -783,9 +799,6 @@ if _NUMBA_AVAILABLE:
         wlvac_arr, wlvac4_arr, cgf_arr, elo_log_arr,
         gammar_arr, gammas_arr, gammaw_arr, line_valid,
         min_hckt, use_tight_prefilter,
-        use_stride_dead_skip,
-        use_stride_tight_skip,
-        do_profile, profile_stats,
         xlines_out, reuse_buffer,
     ):
         return _linop1_kernel_nb_chunk(
@@ -810,9 +823,6 @@ if _NUMBA_AVAILABLE:
             wlvac_arr, wlvac4_arr, cgf_arr, elo_log_arr,
             gammar_arr, gammas_arr, gammaw_arr, line_valid,
             min_hckt, use_tight_prefilter,
-            use_stride_dead_skip,
-            use_stride_tight_skip,
-        do_profile, profile_stats,
             xlines_out, reuse_buffer,
         )
 
@@ -894,9 +904,6 @@ if _NUMBA_AVAILABLE:
         wlvac_arr, wlvac4_arr, cgf_arr, elo_log_arr,
         gammar_arr, gammas_arr, gammaw_arr, line_valid,
         min_hckt, use_tight_prefilter,
-        use_stride_dead_skip,
-        use_stride_tight_skip,
-        do_profile, profile_stats,
         xlines_out, reuse_buffer,
     ):
         if reuse_buffer != 0:
@@ -913,8 +920,6 @@ if _NUMBA_AVAILABLE:
         iline_end = min(int(iline_end), int(n_records))
 
         for iline in range(iline_start, iline_end):
-            if do_profile != 0:
-                profile_stats[0] += 1
             iwl = int(iwl_arr[iline])
             if iwl < iwlold:
                 nucont0 = 0
@@ -975,19 +980,6 @@ if _NUMBA_AVAILABLE:
                     cgf, nelion, nucont0, tab_col_min, max_xnfdop_arr,
                     elo_val, min_hckt, extab, extabf, use_tight_prefilter,
                 ):
-                    if do_profile != 0:
-                        profile_stats[1] += 1
-                    iwlold = iwl
-                    continue
-
-            if use_stride_dead_skip != 0:
-                if _linop1_all_stride_tight_dead_nb(
-                    cgf, nelion, nucont0, tab, xnfdop_arr, nrhox,
-                    elo_val, min_hckt, extab, extabf,
-                ):
-                    if do_profile != 0:
-                        profile_stats[28] += 1
-                        profile_stats[5] += 1
                     iwlold = iwl
                     continue
 
@@ -996,37 +988,18 @@ if _NUMBA_AVAILABLE:
             gammar = np.float32(0.0)
             gammas = np.float32(0.0)
             gammaw = np.float32(0.0)
-            stride_bitmask = 0
-            if use_stride_tight_skip != 0 or use_stride_dead_skip != 0:
-                boltz_max = _fastex_nb(elo_val * min_hckt, extab, extabf)
-            else:
-                boltz_max = np.float32(0.0)
 
-            stride_idx = 0
             for j1 in range(8, nrhox + 1, 8):
-                if do_profile != 0:
-                    profile_stats[2] += 1
                 ifj[j1 + 1] = 0
                 j0 = j1 - 1
                 center = cgf * xnfdop_arr[j0, nelion - 1]
                 if center < tab[j0, nucont0]:
-                    stride_idx += 1
                     continue
-                if use_stride_tight_skip != 0:
-                    if center * boltz_max < tab[j0, nucont0]:
-                        if do_profile != 0:
-                            profile_stats[29] += 1
-                        stride_idx += 1
-                        continue
                 center = center * _fastex_nb(elo_val * hckt_arr[j0], extab, extabf)
                 if center < tab[j0, nucont0]:
-                    stride_idx += 1
                     continue
                 ifj[j1 + 1] = 1
                 ifline = 1
-                stride_bitmask |= 1 << stride_idx
-                if do_profile != 0:
-                    profile_stats[16 + stride_idx] += 1
                 if adamp_seed == 0.0:
                     if use_cached != 0:
                         gammar = gammar_arr[iline]
@@ -1039,42 +1012,22 @@ if _NUMBA_AVAILABLE:
                     adamp_seed = 1.0
                 dop = dopple_arr[j0, nelion - 1]
                 if dop <= 0.0:
-                    stride_idx += 1
                     continue
                 adamp = (gammar + gammas * xne_arr[j0] + gammaw * txnxn[j0]) / dop
                 dopwave = dop * wlvac4
-                if do_profile != 0:
-                    profile_stats[4] += 1
-                    profile_stats[26] += 1
                 _accwings_nb(
                     xlines, j0, nu0, wlvac, center, adamp, dopwave,
                     tab[j0, nucont0], waveset, h0tab, h1tab, h2tab,
                 )
-                stride_idx += 1
-
-            if do_profile != 0:
-                n_active_strides = 0
-                m = stride_bitmask
-                while m > 0:
-                    n_active_strides += m & 1
-                    m >>= 1
-                profile_stats[5 + n_active_strides] += 1
 
             for k1 in range(8, nrhox + 1, 8):
                 if ifj[k1 - 7] + ifj[k1 + 1] == 0:
                     continue
                 for j1 in range(k1 - 7, k1):
-                    if do_profile != 0:
-                        profile_stats[3] += 1
                     j0 = j1 - 1
                     center = cgf * xnfdop_arr[j0, nelion - 1]
                     if center < tab[j0, nucont0]:
                         continue
-                    if use_stride_tight_skip != 0:
-                        if center * boltz_max < tab[j0, nucont0]:
-                            if do_profile != 0:
-                                profile_stats[29] += 1
-                            continue
                     center = center * _fastex_nb(elo_val * hckt_arr[j0], extab, extabf)
                     if center < tab[j0, nucont0]:
                         continue
@@ -1093,9 +1046,6 @@ if _NUMBA_AVAILABLE:
                         adamp_seed = 1.0
                     adamp = (gammar + gammas * xne_arr[j0] + gammaw * txnxn[j0]) / dop
                     dopwave = dop * wlvac4
-                    if do_profile != 0:
-                        profile_stats[4] += 1
-                        profile_stats[27] += 1
                     _accwings_nb(
                         xlines, j0, nu0, wlvac, center, adamp, dopwave,
                         tab[j0, nucont0], waveset, h0tab, h1tab, h2tab,
@@ -1646,33 +1596,38 @@ def linop1(
     speed; otherwise falls back to a pure-Python loop.
     """
 
-    waveset = np.asarray(wave_set_nm, dtype=np.float64)
-    iwavetab = np.asarray(i_wavetab, dtype=np.int64)
+    waveset = _as_contiguous_f64(wave_set_nm)
+    iwavetab = np.ascontiguousarray(i_wavetab, dtype=np.int64)
+    use_linop1_f32 = os.environ.get("ATLAS_LINOP1_FLOAT32", "1") != "0"
     # Fortran LINOP1 uses IMPLICIT REAL*4: TABCONT, XNFDOP, DOPPLE, HCKT4,
     # XNE4 are all REAL*4.  Keep WAVESET as float64 (Fortran REAL*8).
-    tab = np.asarray(tabcont, dtype=np.float32)
-    t = np.asarray(temperature_k, dtype=np.float64)
-    hckt_arr = np.asarray(hckt, dtype=np.float32)
-    xne_arr = np.asarray(xne, dtype=np.float32)
-    xnf_arr = np.asarray(xnf, dtype=np.float64)
-    xnfdop_arr = np.asarray(xnfdop, dtype=np.float32)
-    dopple_arr = np.asarray(dopple, dtype=np.float32)
-
+    tab = _as_contiguous_f32(tabcont)
+    t = _as_contiguous_f64(temperature_k)
+    if use_linop1_f32:
+        hckt_arr = _as_contiguous_f32(hckt)
+        xne_arr = _as_contiguous_f32(xne)
+        xnfdop_arr = _as_contiguous_f32(xnfdop)
+        dopple_arr = _as_contiguous_f32(dopple)
+        extab, extabf = _build_exptab_f32()
+        tablog = _build_tablog_f32()
+        h0tab, h1tab, h2tab = _build_h_tables_f32()
+    else:
+        hckt_arr = np.asarray(hckt, dtype=np.float64)
+        xne_arr = np.asarray(xne, dtype=np.float64)
+        xnfdop_arr = np.asarray(xnfdop, dtype=np.float64)
+        dopple_arr = np.asarray(dopple, dtype=np.float64)
+        extab, extabf = _build_exptab()
+        extab = np.asarray(extab, dtype=np.float64)
+        extabf = np.asarray(extabf, dtype=np.float64)
+        tablog = np.asarray(_build_tablog(), dtype=np.float64)
+        h0tab, h1tab, h2tab = _build_h_tables()
     nrhox = int(t.size)
     numnu = int(waveset.size)
     nuhi_eff = numnu if nuhi is None else int(nuhi)
     if nrhox != 80:
         raise ValueError(f"LINOP1 expects 80 depth layers, got {nrhox}")
 
-    extab, extabf = _build_exptab()
-    extab = np.asarray(extab, dtype=np.float32)
-    extabf = np.asarray(extabf, dtype=np.float32)
-    tablog = np.asarray(_build_tablog(), dtype=np.float32)
-    h0tab, h1tab, h2tab = _build_h_tables()
-    h0tab = np.asarray(h0tab, dtype=np.float32)
-    h1tab = np.asarray(h1tab, dtype=np.float32)
-    h2tab = np.asarray(h2tab, dtype=np.float32)
-
+    xnf_arr = _as_contiguous_f64(xnf)
     # Fortran: TXNXN is REAL*4 (line 9950), computed from REAL*8 then truncated
     txnxn = np.asarray(
         (xnf_arr[:, 0] + 0.42 * xnf_arr[:, 2] + 0.85 * xnf_arr[:, 840]) * (t / 10000.0) ** 0.3,
@@ -1699,8 +1654,12 @@ def linop1(
         use_linop1_prefilter = os.environ.get("ATLAS_LINOP1_PREFILTER", "1") != "0"
         prefilter_flag = 1 if use_linop1_prefilter else 0
         if use_linop1_prefilter:
-            tab_col_min = np.min(tab, axis=0).astype(np.float32, copy=False)
-            max_xnfdop_arr = np.max(xnfdop_arr, axis=0).astype(np.float32, copy=False)
+            if use_linop1_f32:
+                tab_col_min = _tab_col_min_nb(tab)
+                max_xnfdop_arr = _max_xnfdop_col_nb(xnfdop_arr)
+            else:
+                tab_col_min = np.min(tab, axis=0).astype(np.float32, copy=False)
+                max_xnfdop_arr = np.max(xnfdop_arr, axis=0).astype(np.float32, copy=False)
         else:
             tab_col_min = np.zeros(1, dtype=np.float32)
             max_xnfdop_arr = np.zeros(1, dtype=np.float32)
@@ -1709,15 +1668,7 @@ def linop1(
         use_tight_prefilter = int(
             os.environ.get("ATLAS_LINOP1_TIGHT_PREFILTER", "1") != "0"
         )
-        use_stride_dead_skip = int(
-            os.environ.get("ATLAS_LINOP1_STRIDE_DEAD_SKIP", "0") != "0"
-        )
-        use_stride_tight_skip = int(
-            os.environ.get("ATLAS_LINOP1_STRIDE_TIGHT_SKIP", "0") != "0"
-        )
         min_hckt = np.float32(np.min(hckt_arr))
-        do_profile = int(os.environ.get("ATLAS_LINOP1_PROFILE", "0") == "1")
-        profile_stats = np.zeros(_LINOP1_PROFILE_STATS_SIZE, dtype=np.int64)
 
         scalar_cache = _get_linop1_scalar_cache(records, tablog)
         use_cached = 1 if scalar_cache is not None else 0
@@ -1783,10 +1734,7 @@ def linop1(
                 ]
 
             def _run_chunk(c: int):
-                local_prof = np.zeros(_LINOP1_PROFILE_STATS_SIZE, dtype=np.int64)
-                prof_arr = local_prof if do_profile else profile_stats
-                prof_flag = do_profile
-                result = _linop1_kernel_nb_chunk(
+                return _linop1_kernel_nb_chunk(
                     int(chunk_starts[c]),
                     int(chunk_ends[c]),
                     int(nu0_st[c]),
@@ -1837,22 +1785,12 @@ def linop1(
                     line_valid,
                     min_hckt,
                     use_tight_prefilter,
-                    use_stride_dead_skip,
-                    use_stride_tight_skip,
-                    prof_flag,
-                    prof_arr,
                     local_chunk_bufs[c],
                     1,
                 )
-                return result, local_prof
 
             with ThreadPoolExecutor(max_workers=n_chunks) as pool:
                 chunk_results = list(pool.map(_run_chunk, range(n_chunks)))
-            if do_profile:
-                profile_stats[:] = 0
-                for _res in chunk_results:
-                    profile_stats += _res[1]
-            chunk_results = [r[0] for r in chunk_results]
             if xlines_buf is not None and xlines_buf.shape == (nrhox, numnu):
                 xlines = xlines_buf
                 xlines.fill(np.float32(0.0))
@@ -1899,42 +1837,10 @@ def linop1(
                 line_valid,
                 min_hckt,
                 use_tight_prefilter,
-                use_stride_dead_skip,
-                use_stride_tight_skip,
-                do_profile,
-                profile_stats,
                 xlines_out,
                 reuse_buffer,
             )
 
-        if do_profile:
-            hist_parts = " ".join(
-                f"n{n}={int(profile_stats[5 + n])}"
-                for n in range(_LINOP1_N_STRIDE_BANDS + 1)
-            )
-            stride_parts = " ".join(
-                f"s{s}={int(profile_stats[16 + s])}"
-                for s in range(_LINOP1_N_STRIDE_BANDS)
-            )
-            _logger.info(
-                "LINOP1 profile: lines=%d prefilter_skip=%d j0_outer=%d "
-                "inner7=%d wings=%d outer_wings=%d inner_wings=%d "
-                "stride_dead_skip=%d tight_stride_skip=%d cached=%d tight_prefilter=%d stride_dead_skip_on=%d",
-                int(profile_stats[0]),
-                int(profile_stats[1]),
-                int(profile_stats[2]),
-                int(profile_stats[3]),
-                int(profile_stats[4]),
-                int(profile_stats[26]),
-                int(profile_stats[27]),
-                int(profile_stats[28]),
-                int(profile_stats[29]),
-                use_cached,
-                use_tight_prefilter,
-                use_stride_dead_skip,
-            )
-            _logger.info("LINOP1 stride histogram: %s", hist_parts)
-            _logger.info("LINOP1 per-stride activation: %s", stride_parts)
         return LineOpacityState(xlines=xlines, lineused=int(lineused))
 
     # --- pure-Python fallback (slow, only used when numba is absent) ---

@@ -1665,6 +1665,125 @@ if _NUMBA_AVAILABLE:
                 trans_grid[4, j] = _he12p1p_jit(f, he12p1p_freq, he12p1p_x)
 
     @numba.njit(cache=True, parallel=True, nogil=True)
+    def _hop_bolt_nb(
+        bolt: np.ndarray,
+        tkev: np.ndarray,
+        xnfph1: np.ndarray,
+        rho: np.ndarray,
+        bhyd: np.ndarray,
+    ) -> None:
+        """HOP Boltzmann factors for n=1..8 (atlas12.for lines 5268-5312)."""
+        n_layers = tkev.shape[0]
+        for j in numba.prange(n_layers):
+            tkev_j = tkev[j]
+            rho_j = rho[j]
+            xnf_j = xnfph1[j]
+            for n in range(8):
+                nn = n + 1
+                val = (
+                    np.exp(-(13.595 - 13.595 / float(nn * nn)) / tkev_j)
+                    * 2.0
+                    * float(nn * nn)
+                    * xnf_j
+                    / rho_j
+                )
+                if n < 6:
+                    val *= bhyd[j, n]
+                bolt[j, n] = val
+
+    @numba.njit(cache=True, parallel=True, nogil=True)
+    def _hop_bhyd_terms_nb(
+        h: np.ndarray,
+        s: np.ndarray,
+        cont_h: np.ndarray,
+        bolt: np.ndarray,
+        bhyd: np.ndarray,
+        ehvkt: np.ndarray,
+        bnu_all: np.ndarray,
+        stim: np.ndarray,
+    ) -> None:
+        """Add HOP bound-free terms for n=1..6 with BHYD source correction."""
+        n_layers = h.shape[0]
+        nfreq = h.shape[1]
+        for j in numba.prange(n_layers):
+            for n in range(6):
+                bh = bhyd[j, n]
+                if bh < 1.0e-300:
+                    bh = 1.0e-300
+                bolt_jn = bolt[j, n]
+                for i in range(nfreq):
+                    term = cont_h[n, i] * bolt_jn
+                    h[j, i] += term * (1.0 - ehvkt[j, i] / bh)
+                    s[j, i] += term * bnu_all[j, i] * stim[j, i] / bh
+
+    @numba.njit(cache=True, parallel=True, nogil=True)
+    def _hminop_fftheta_nb(
+        fftheta: np.ndarray,
+        fftt: np.ndarray,
+        theta: np.ndarray,
+        thetaff: np.ndarray,
+    ) -> None:
+        """Interpolate HMINOP FFTT over THETA for each layer."""
+        n_layers = theta.shape[0]
+        nthetaff = thetaff.shape[0]
+        nfreq = fftt.shape[1]
+        for layer_idx in numba.prange(n_layers):
+            th = theta[layer_idx]
+            iold = 1
+            for k in range(1, nthetaff):
+                if thetaff[k] > th:
+                    iold = k
+                    break
+            else:
+                iold = nthetaff - 1
+            if iold < 1:
+                iold = 1
+            denom = thetaff[iold] - thetaff[iold - 1]
+            if abs(denom) < 1.0e-40:
+                for i in range(nfreq):
+                    fftheta[layer_idx, i] = fftt[iold - 1, i]
+            else:
+                weight = (th - thetaff[iold - 1]) / denom
+                for i in range(nfreq):
+                    fftheta[layer_idx, i] = (
+                        fftt[iold - 1, i]
+                        + (fftt[iold, i] - fftt[iold - 1, i]) * weight
+                    )
+
+    @numba.njit(cache=True, parallel=True, nogil=True)
+    def _h2plop_active_nb(
+        ah2p: np.ndarray,
+        active_idx: np.ndarray,
+        es: np.ndarray,
+        fr: np.ndarray,
+        tkev: np.ndarray,
+        xnfph1: np.ndarray,
+        xnfph2: np.ndarray,
+        bhyd1: np.ndarray,
+        rho: np.ndarray,
+        stim: np.ndarray,
+    ) -> None:
+        """H2+ opacity on active frequency indices (atlas7v.for lines 5189-5211)."""
+        n_layers = tkev.shape[0]
+        n_active = active_idx.shape[0]
+        for j in numba.prange(n_layers):
+            tkev_j = tkev[j]
+            log_xnf1 = np.log(max(xnfph1[j], 1.0e-40))
+            pref = (
+                2.0
+                * bhyd1[j]
+                * xnfph2[j]
+                / rho[j]
+            )
+            for ai in range(n_active):
+                ia = active_idx[ai]
+                ah2p[j, ia] = (
+                    np.exp(-es[ai] / tkev_j + fr[ai] + log_xnf1)
+                    * pref
+                    * stim[j, ia]
+                )
+
+    @numba.njit(cache=True, parallel=True, nogil=True)
     def _lukeop_aluke_nb(
         aluke: np.ndarray,
         freq: np.ndarray,
@@ -2005,16 +2124,19 @@ def compute_kapp_continuum(
 
         tkev = np.maximum(temp * KBOLTZ_EV, 1e-300)
         bolt = np.zeros((n_layers, 8), dtype=np.float64)
-        for n in range(1, 9):
-            bolt[:, n - 1] = (
-                np.exp(-(13.595 - 13.595 / float(n * n)) / tkev)
-                * 2.0
-                * float(n * n)
-                * xnfph1
-                / rho
-            )
-            if n <= 6:
-                bolt[:, n - 1] *= bhyd[:, n - 1]
+        if _NUMBA_AVAILABLE:
+            _hop_bolt_nb(bolt, tkev, xnfph1, rho, bhyd)
+        else:
+            for n in range(1, 9):
+                bolt[:, n - 1] = (
+                    np.exp(-(13.595 - 13.595 / float(n * n)) / tkev)
+                    * 2.0
+                    * float(n * n)
+                    * xnfph1
+                    / rho
+                )
+                if n <= 6:
+                    bolt[:, n - 1] *= bhyd[:, n - 1]
         freet = xne * xnf_h_ionized / rho / np.sqrt(np.maximum(temp, 1e-300))
         xr = xnfph1 * (tkev / 13.595) / rho
         boltex = np.exp(-13.427 / tkev) * xr
@@ -2038,11 +2160,14 @@ def compute_kapp_continuum(
             + coulff_h * freet[:, np.newaxis] * cfree[np.newaxis, :]
         ) * stim
         s = h * bnu_all
-        for n in range(6):
-            bh = np.maximum(bhyd[:, n], 1e-300)
-            term = cont_h[n, :][np.newaxis, :] * bolt[:, n][:, np.newaxis]
-            h = h + term * (1.0 - ehvkt / bh[:, np.newaxis])
-            s = s + term * bnu_all * stim / bh[:, np.newaxis]
+        if _NUMBA_AVAILABLE:
+            _hop_bhyd_terms_nb(h, s, cont_h, bolt, bhyd, ehvkt, bnu_all, stim)
+        else:
+            for n in range(6):
+                bh = np.maximum(bhyd[:, n], 1e-300)
+                term = cont_h[n, :][np.newaxis, :] * bolt[:, n][:, np.newaxis]
+                h = h + term * (1.0 - ehvkt / bh[:, np.newaxis])
+                s = s + term * bnu_all * stim / bh[:, np.newaxis]
         ahyd[:, :] = h
         shyd[:, :] = np.where(h > 0.0, s / np.maximum(h, 1e-300), bnu_all)
 
@@ -2091,18 +2216,33 @@ def compute_kapp_continuum(
                     if bhyd.shape[1] > 0
                     else np.ones(n_layers, dtype=np.float64)
                 )
-                ah2p[:, active] = (
-                    np.exp(
-                        -es[np.newaxis, :] / tkev[:, np.newaxis]
-                        + fr[np.newaxis, :]
-                        + np.log(np.maximum(xnfph1, 1e-40))[:, np.newaxis]
+                if _NUMBA_AVAILABLE:
+                    active_idx = np.flatnonzero(active).astype(np.int64)
+                    _h2plop_active_nb(
+                        ah2p,
+                        active_idx,
+                        es,
+                        fr,
+                        tkev,
+                        xnfph1,
+                        xnfph2,
+                        bhyd1,
+                        rho,
+                        stim,
                     )
-                    * 2.0
-                    * bhyd1[:, np.newaxis]
-                    * xnfph2[:, np.newaxis]
-                    / rho[:, np.newaxis]
-                    * stim[:, active]
-                )
+                else:
+                    ah2p[:, active] = (
+                        np.exp(
+                            -es[np.newaxis, :] / tkev[:, np.newaxis]
+                            + fr[np.newaxis, :]
+                            + np.log(np.maximum(xnfph1, 1e-40))[:, np.newaxis]
+                        )
+                        * 2.0
+                        * bhyd1[:, np.newaxis]
+                        * xnfph2[:, np.newaxis]
+                        / rho[:, np.newaxis]
+                        * stim[:, active]
+                    )
 
     # HE1OP: Helium I opacity (atlas12.for lines 6007-6127)
     if ifop[4] == 1 and atmosphere.xnf_he1 is not None:
@@ -2428,15 +2568,23 @@ def compute_kapp_continuum(
         # Interpolate FFTT over THETA for each layer.  The theta bracket is
         # layer-only, so reuse it across the full frequency grid.
         fftheta = np.empty((n_layers, nfreq), dtype=np.float64)
-        for layer_idx in range(n_layers):
-            iold = int(np.searchsorted(HMINOP_THETAFF, theta[layer_idx], side="right"))
-            iold = max(1, min(iold, nthetaff - 1))
-            denom = HMINOP_THETAFF[iold] - HMINOP_THETAFF[iold - 1]
-            if abs(denom) < 1e-40:
-                fftheta[layer_idx, :] = fftt[iold - 1, :]
-            else:
-                weight = (theta[layer_idx] - HMINOP_THETAFF[iold - 1]) / denom
-                fftheta[layer_idx, :] = fftt[iold - 1, :] + (fftt[iold, :] - fftt[iold - 1, :]) * weight
+        if _NUMBA_AVAILABLE:
+            _hminop_fftheta_nb(
+                fftheta,
+                fftt,
+                theta,
+                np.asarray(HMINOP_THETAFF, dtype=np.float64),
+            )
+        else:
+            for layer_idx in range(n_layers):
+                iold = int(np.searchsorted(HMINOP_THETAFF, theta[layer_idx], side="right"))
+                iold = max(1, min(iold, nthetaff - 1))
+                denom = HMINOP_THETAFF[iold] - HMINOP_THETAFF[iold - 1]
+                if abs(denom) < 1e-40:
+                    fftheta[layer_idx, :] = fftt[iold - 1, :]
+                else:
+                    weight = (theta[layer_idx] - HMINOP_THETAFF[iold - 1]) / denom
+                    fftheta[layer_idx, :] = fftt[iold - 1, :] + (fftt[iold, :] - fftt[iold - 1, :]) * weight
 
         # HMINBF from MAP1 (atlas7v.for line 5306)
         hminbf = np.zeros(nfreq, dtype=np.float64)

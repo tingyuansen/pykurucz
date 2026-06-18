@@ -469,25 +469,40 @@ def _accumulate_mol_fused_batch(
             valid_counts[di] = 0
             continue
 
+        # Hoist per-element depth quantities out of the n_mol_lines loop. dop/pop
+        # live at molecular slot 5 and only take n_elem distinct values per depth,
+        # so precomputing them (and xnfdop = pop/(rho*dop)) here removes a division
+        # and a strided 2-D load from every inner iteration. xnfdop is computed
+        # with the identical expression, so the result is bitwise unchanged.
+        dop_e = dop_arr[di, 5, :]
+        pop_e = pop_arr[di, 5, :]
+        xnfdop_e = np.zeros(n_elem, dtype=np.float64)
+        elem_ok = np.zeros(n_elem, dtype=np.bool_)
+        for e in range(n_elem):
+            dv = dop_e[e]
+            pv = pop_e[e]
+            if dv > 0.0 and pv > 0.0:
+                xnfdop_e[e] = pv / (rho * dv)
+                elem_ok[e] = True
+
         for li in range(n_mol_lines):
             ei = int(mol_element_idx[li])
             if ei < 0 or ei >= n_elem:
+                continue
+            if not elem_ok[ei]:
                 continue
 
             line_wl = mol_wavelength[li]
             if line_wl <= 0.0:
                 continue
 
-            dop_val = dop_arr[di, 5, ei]
-            pop_val = pop_arr[di, 5, ei]
-            if dop_val <= 0.0 or pop_val <= 0.0:
-                continue
+            dop_val = dop_e[ei]
 
             ci = int(center_indices[li])
             clamped_center = max(0, min(ci, n_wl - 1))
             kapmin = cutoff * cont_row[clamped_center]
 
-            xnfdop = pop_val / (rho * dop_val)
+            xnfdop = xnfdop_e[ei]
             kappa0_pre = mol_cgf[li] * xnfdop
             if kappa0_pre < kapmin:
                 continue
@@ -3306,18 +3321,24 @@ def run_synthesis(cfg: SynthesisConfig, *, synthe_policy=None) -> SynthResult:
 
                 # --- Phase 3b: Build molecular line flat arrays ---
                 mol_nelion_raw = np.asarray(combined_mol["nelion"], dtype=np.int32)
+                # Per-line streaming arrays: stored as REAL*4 / int32 to match
+                # Fortran SYNTHE line-data precision and to halve the bytes the
+                # depth-parallel molecular kernel re-streams (bandwidth bound).
                 mol_element_idx = np.array(
-                    [int(n) // 6 - 1 for n in mol_nelion_raw], dtype=np.int64
+                    [int(n) // 6 - 1 for n in mol_nelion_raw], dtype=np.int32
                 )
-                mol_cgf = np.asarray(combined_mol["cgf"], dtype=np.float64)
-                mol_gamma_rad = np.asarray(combined_mol["gamma_rad"], dtype=np.float64)
-                mol_gamma_stark = np.asarray(combined_mol["gamma_stark"], dtype=np.float64)
-                mol_gamma_vdw = np.asarray(combined_mol["gamma_vdw"], dtype=np.float64)
+                mol_cgf = np.asarray(combined_mol["cgf"], dtype=np.float32)
+                mol_gamma_rad = np.asarray(combined_mol["gamma_rad"], dtype=np.float32)
+                mol_gamma_stark = np.asarray(combined_mol["gamma_stark"], dtype=np.float32)
+                mol_gamma_vdw = np.asarray(combined_mol["gamma_vdw"], dtype=np.float32)
                 mol_nbuff = np.asarray(combined_mol["nbuff"], dtype=np.int32)
-                mol_elo_cm = np.asarray(combined_mol["elo_cm"], dtype=np.float64)
+                mol_elo_cm = np.asarray(combined_mol["elo_cm"], dtype=np.float32)
 
-                # Reconstruct wavelength from nbuff (inverse of compilation formula)
-                mol_wavelength = np.exp((mol_nbuff.astype(np.float64) - 1 + _ixwlbeg) * _ratiolg)
+                # Reconstruct wavelength from nbuff (inverse of compilation formula).
+                # Compute in float64 for grid accuracy, store as float32 (REAL*4).
+                mol_wavelength = np.exp(
+                    (mol_nbuff.astype(np.float64) - 1 + _ixwlbeg) * _ratiolg
+                ).astype(np.float32)
 
                 # CRITICAL FIX: Use nbuff-1 as center index directly, NOT _nearest_grid_indices.
                 # _nearest_grid_indices returns sentinel -1 for ALL lines below the grid, meaning
@@ -3328,7 +3349,7 @@ def run_synthesis(cfg: SynthesisConfig, *, synthe_policy=None) -> SynthResult:
                 # so far-below-grid lines have wings that never reach the valid range.
                 # nbuff is 1-based relative to the synthesis grid, so center_idx = nbuff - 1
                 # correctly places each line (positive = in grid, negative = below grid by |idx| bins).
-                mol_center_indices = (mol_nbuff.astype(np.int64) - 1)
+                mol_center_indices = (mol_nbuff.astype(np.int32) - 1)
 
                 # Pre-compute shared per-depth arrays used by every chunk
                 _hckt_arr = np.asarray(
@@ -3385,7 +3406,7 @@ def run_synthesis(cfg: SynthesisConfig, *, synthe_policy=None) -> SynthResult:
                         c_valid_counts,
                         cont_arr,
                         wavelength,
-                        c_center_indices.astype(np.int64),
+                        c_center_indices,
                         c_wavelength,
                         c_element_idx,
                         c_cgf,

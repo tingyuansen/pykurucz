@@ -214,6 +214,21 @@ def _build_kapp_adapter(
     )
 
 
+# Per-column floors for early-stop convergence (cm^-3, dyn/cm^2, K, etc.).
+# A single 1e-300 floor overflows when XNE jumps 0 -> ~1e15 on grey cold-start.
+_CONVERGENCE_COLUMN_FLOOR: dict[str, float] = {
+    "RHOX": 1.0e-20,
+    "T": 1.0,
+    "P": 1.0e-6,
+    "XNE": 1.0e10,
+    "ABROSS": 1.0e-6,
+    "VTURB": 1.0e-6,
+    "ACCRAD": 1.0e-6,
+}
+# Use max(|before|, |after|, floor) when the column can be zero on CALCULATE/grey start.
+_CONVERGENCE_SYMMETRIC_COLUMNS = frozenset({"XNE", "P", "RHOX", "VTURB", "ACCRAD"})
+
+
 def _max_normalized_column_delta(
     before: np.ndarray,
     after: np.ndarray,
@@ -232,7 +247,40 @@ def _max_normalized_column_delta(
         )
     else:
         denom = np.maximum(np.abs(before_arr), floor)
-    return float(np.max(np.abs(after_arr - before_arr) / denom))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratios = np.abs(after_arr - before_arr) / denom
+    finite = ratios[np.isfinite(ratios)]
+    if finite.size == 0:
+        return float("nan")
+    return float(np.max(finite))
+
+
+def _fortran_checkconv_dlnt(before: np.ndarray, after: np.ndarray) -> float:
+    """Fortran ``checkconv.f90`` convergence metric (temperature only).
+
+    Fortran computes ``dlnt(j) = ABS(temp(j,N-1)-temp(j,N))/temp(j,N)`` and
+    tests ``MAXVAL(dlnt(40:jmax-5)) < dlntmax`` with ``jmax=80`` (deep layers
+    40..75, 1-based). In Python 0-based that is the slice ``[39:75]``. The deep
+    window is clamped for any layer count != 80; if it would be empty the whole
+    profile is used.
+    """
+    before_arr = np.asarray(before, dtype=np.float64)
+    after_arr = np.asarray(after, dtype=np.float64)
+    if before_arr.shape != after_arr.shape or before_arr.ndim != 1 or before_arr.size == 0:
+        return float("nan")
+    n = before_arr.size
+    lo = 39
+    hi = n - 5  # Fortran jmax-5 (exclusive end in Python slicing -> layers 40..75)
+    if hi - lo < 1:
+        lo, hi = 0, n
+    t_old = before_arr[lo:hi]
+    t_new = after_arr[lo:hi]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dlnt = np.abs(t_new - t_old) / np.abs(t_new)
+    finite = dlnt[np.isfinite(dlnt)]
+    if finite.size == 0:
+        return float("nan")
+    return float(np.max(finite))
 
 
 def _convec_fd_samples(
@@ -701,6 +749,9 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
     convergence_min_iterations = max(1, int(cfg.convergence_min_iterations))
     convergence_consecutive_required = max(1, int(cfg.convergence_consecutive))
     convergence_consecutive_count = 0
+    # Early-stop criterion mirrors Fortran checkconv.f90: deep-layer temperature
+    # test. Fortran checkconv.f90 dlntmax parameter (REAL, PARAMETER :: dlntmax=1E-4).
+    checkconv_dlntmax = float(os.environ.get("ATLAS_CHECKCONV_DLNTMAX", "1.0e-4"))
     n_workers = max(1, policy.atlas_freq_pool)
     completed_iterations = 0
 
@@ -880,6 +931,8 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
         )
 
     _linop1_xlines_buf: np.ndarray | None = None
+    _linop1_wave_f64: np.ndarray | None = None
+    _linop1_iwavetab_i64: np.ndarray | None = None
 
     for iter_idx in range(numits):
         iter_no = iter_idx + 1
@@ -1047,17 +1100,23 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
                     (atm.layers, int(wave_nm.size)),
                     dtype=np.float32,
                 )
+            if (
+                _linop1_wave_f64 is None
+                or _linop1_wave_f64.shape[0] != int(wave_nm.size)
+            ):
+                _linop1_wave_f64 = np.ascontiguousarray(wave_nm, dtype=np.float64)
+                _linop1_iwavetab_i64 = np.ascontiguousarray(i_wavetab, dtype=np.int64)
             line_state = linop1(
                 records=records,
-                wave_set_nm=np.asarray(wave_nm, dtype=np.float64),
-                i_wavetab=np.asarray(i_wavetab, dtype=np.int64),
-                tabcont=np.asarray(tabcont, dtype=np.float64),
-                temperature_k=np.asarray(atm.temperature, dtype=np.float64),
-                hckt=np.asarray(atm.hckt, dtype=np.float64),
-                xne=np.asarray(state.xne, dtype=np.float64),
-                xnf=np.asarray(state.xnf, dtype=np.float64),
-                xnfdop=np.asarray(state.xnfdop, dtype=np.float64),
-                dopple=np.asarray(state.dopple, dtype=np.float64),
+                wave_set_nm=_linop1_wave_f64,
+                i_wavetab=_linop1_iwavetab_i64,
+                tabcont=np.ascontiguousarray(tabcont, dtype=np.float32),
+                temperature_k=np.ascontiguousarray(atm.temperature, dtype=np.float64),
+                hckt=np.ascontiguousarray(atm.hckt, dtype=np.float32),
+                xne=np.ascontiguousarray(state.xne, dtype=np.float32),
+                xnf=np.ascontiguousarray(state.xnf, dtype=np.float64),
+                xnfdop=np.ascontiguousarray(state.xnfdop, dtype=np.float32),
+                dopple=np.ascontiguousarray(state.dopple, dtype=np.float32),
                 nulo=1,
                 nuhi=int(wave_nm.size),
                 xlines_buf=_linop1_xlines_buf,
@@ -1661,8 +1720,8 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
                 name: _max_normalized_column_delta(
                     convergence_before[name],
                     value,
-                    floor=1.0e-300,
-                    symmetric=(name in {"VTURB", "ACCRAD"}),
+                    floor=_CONVERGENCE_COLUMN_FLOOR.get(name, 1.0e-300),
+                    symmetric=name in _CONVERGENCE_SYMMETRIC_COLUMNS,
                 )
                 for name, value in convergence_after.items()
             }
@@ -1674,20 +1733,31 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
             convergence_max = max(
                 value for value in convergence_metrics.values() if np.isfinite(value)
             )
+            # Fortran checkconv.f90 deep-layer temperature metric (diagnostic +
+            # default early-stop driver). Logged every iteration regardless of
+            # which criterion is active, so the two can be compared offline.
+            checkconv_dlnt = _fortran_checkconv_dlnt(
+                convergence_before["T"], convergence_after["T"]
+            )
             logger.info(
-                "Convergence iteration %d/%d: physical_max=%.3e max_col=%.3e %s",
+                "Convergence iteration %d/%d: physical_max=%.3e max_col=%.3e "
+                "checkconv_dlnt=%.3e %s",
                 iter_no,
                 numits,
                 physical_convergence_max,
                 convergence_max,
+                checkconv_dlnt,
                 " ".join(
                     f"{name}={value:.3e}" for name, value in convergence_metrics.items()
                 ),
             )
+            criterion_met = (
+                np.isfinite(checkconv_dlnt) and checkconv_dlnt < checkconv_dlntmax
+            )
             converged_this_iter = (
                 convergence_epsilon is not None
                 and iter_no >= convergence_min_iterations
-                and physical_convergence_max < convergence_epsilon
+                and criterion_met
             )
             if converged_this_iter:
                 convergence_consecutive_count += 1
@@ -1710,10 +1780,13 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
         ):
             logger.info(
                 "Convergence early stop at iteration %d/%d: "
-                "physical_max=%.3e epsilon=%.3e min_iterations=%d consecutive=%d",
+                "physical_max=%.3e checkconv_dlnt=%.3e dlntmax=%.3e epsilon=%.3e "
+                "min_iterations=%d consecutive=%d",
                 iter_no,
                 numits,
                 physical_convergence_max,
+                checkconv_dlnt,
+                checkconv_dlntmax,
                 convergence_epsilon,
                 convergence_min_iterations,
                 convergence_consecutive_required,

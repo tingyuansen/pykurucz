@@ -79,9 +79,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help=(
-            "Optional early-stop threshold on max normalized change across "
-            "physical atmosphere columns (RHOX,T,P,XNE,ABROSS,VTURB). "
-            "Disabled by default."
+            "Early-stop enable switch. When set, ATLAS stops once the Fortran "
+            "checkconv.f90 criterion is met (max |dT/T| over deep layers 40-75 "
+            "< dlntmax, 1e-4). Disabled by default."
         ),
     )
     parser.add_argument(
