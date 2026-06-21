@@ -13,12 +13,18 @@ def npz_cache_key(
     atlas_tables: Path,
     molecules: Path,
     converter_script: Path,
+    continua: Path | None = None,
 ) -> str:
-    """SHA256 key from atm content + dependency mtimes/sizes."""
+    """SHA256 key from atm content + dependency mtimes/sizes.
+
+    ``continua`` (continua.dat) is hashed because convert_atm_to_npz bakes its
+    continuum edges into the output; omitting it would return a stale npz if
+    continua.dat changed.
+    """
     h = hashlib.sha256()
     h.update(atm_path.read_bytes())
-    for path in (atlas_tables, molecules, converter_script):
-        if path.is_file():
+    for path in (atlas_tables, molecules, converter_script, continua):
+        if path is not None and path.is_file():
             st = path.stat()
             h.update(str(path).encode())
             h.update(str(st.st_mtime_ns).encode())

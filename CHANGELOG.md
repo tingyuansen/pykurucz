@@ -64,8 +64,16 @@ far-UV / marginal items don't touch the 480–520 nm validation):
 robustness guards from the published release; that pre-existing hardening is
 unchanged, not new in this update.)
 
-### Remaining follow-ups (opt-in, off by default — no effect on default runs)
+### Opt-in robustness fixes (off by default — no effect on default runs)
 
-- `fort12` cache key omits abundances/logg/vturb; `npz_cache` omits
-  `continua.dat`; `ATLAS_POPS_PARALLEL=1` has data races. All inactive unless
-  explicitly enabled.
+- `atlas_py/physics/fort12_cache.py` — the SELECTLINES disk cache key now folds
+  in an abundance/logg/vturb fingerprint, so a shared `--cache-dir` can no longer
+  reuse one chemistry's line selection for a different abundance or gravity.
+- `synthe_py/tools/npz_cache.py` — the npz cache key now includes `continua.dat`
+  (its continuum edges are baked into the npz; omitting it could return a stale
+  result if continua.dat changed).
+- `atlas_py/physics/popsall.py` — under `ATLAS_POPS_PARALLEL=1`, jobs writing the
+  same XNFP column (the molecular mode=1/mode=11 pair) are now grouped to run in
+  order within one worker, so parallel results match serial exactly. The
+  per-layer `populations`/`NELECT` parallel paths were verified row-disjoint
+  (no race) and left as-is.

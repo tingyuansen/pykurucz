@@ -38,8 +38,16 @@ def fort12_cache_key(
     fort41_path: Optional[Path],
     fort51_path: Optional[Path],
     fort61_path: Optional[Path],
+    atm_fingerprint: str = "",
 ) -> str:
-    """Stable cache key: catalog fingerprints + teff-bucketed waveset start."""
+    """Stable cache key: catalog fingerprints + teff-bucketed waveset start +
+    an atmosphere/chemistry fingerprint.
+
+    SELECTLINES picks lines via ``CENRATIO ∝ XNFDOPMAX``, which depends on the
+    abundances and the atmosphere structure (logg, vturb). ``atm_fingerprint``
+    must encode those so a shared ``--cache-dir`` cannot reuse one chemistry's
+    line selection for a different one.
+    """
     wave_set, _ = build_waveset(float(teff))
     nustart_bucket = int(round(float(wave_set[0]) * 1000.0))
     cat_hash = _catalog_fingerprint(
@@ -53,7 +61,25 @@ def fort12_cache_key(
             fort61_path,
         )
     )
-    return f"{cat_hash}_ns{nustart_bucket}"
+    suffix = f"_{atm_fingerprint}" if atm_fingerprint else ""
+    return f"{cat_hash}_ns{nustart_bucket}{suffix}"
+
+
+def atmosphere_fingerprint(
+    *,
+    gravity_cgs: float,
+    vturb,
+    abundances,
+) -> str:
+    """Short hash of (gravity, vturb, abundances) for the fort.12 cache key."""
+    import numpy as np
+
+    h = hashlib.sha256()
+    h.update(f"g{float(gravity_cgs):.8e}".encode())
+    h.update(np.ascontiguousarray(np.asarray(vturb, dtype=np.float64)).tobytes())
+    for z in sorted(abundances):
+        h.update(f"{int(z)}:{float(abundances[z]):.10e};".encode())
+    return h.hexdigest()[:16]
 
 
 def resolve_fort12_cache_path(

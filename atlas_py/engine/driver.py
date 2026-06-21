@@ -26,6 +26,7 @@ from ..physics.josh import josh_depth_profiles
 from ..physics.kapcont import kapcont_baseline, kapcont_table
 from ..physics.hydrogen_wings import compute_hydrogen_wings
 from ..physics.fort12_cache import (
+    atmosphere_fingerprint,
     fort12_cache_key,
     load_or_prepare_fort12_cache,
     resolve_fort12_cache_path,
@@ -908,6 +909,13 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
             fort41_path=cfg.inputs.fort41_path,
             fort51_path=cfg.inputs.fort51_path,
             fort61_path=cfg.inputs.fort61_path,
+            # Chemistry/atmosphere identity: a shared --cache-dir must not reuse
+            # one chemistry's SELECTLINES output for a different abundance/logg.
+            atm_fingerprint=atmosphere_fingerprint(
+                gravity_cgs=gravity_cgs,
+                vturb=atm.vturb,
+                abundances=atm.abundances,
+            ),
         )
         cached_fort12 = resolve_fort12_cache_path(cfg.cache_dir, fort12_cache_key_val)
         if cached_fort12.exists():

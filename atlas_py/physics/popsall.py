@@ -216,23 +216,37 @@ def _dispatch_popsall_jobs(
 ) -> None:
     """Run independent POPS calls; each writes a disjoint XNF/XNFP slice."""
     if pops_parallel_enabled() and len(jobs) > 1:
-        workers = min(pops_parallel_workers(), len(jobs))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(
-                pool.map(
-                    lambda job: _run_popsall_job(
-                        job,
-                        temperature_k=temperature_k,
-                        tk_erg=tk_erg,
-                        state=state,
-                        ifmol=ifmol,
-                        ifpres=ifpres,
-                        itemp=itemp,
-                        itemp_cache=itemp_cache,
-                    ),
-                    jobs,
+        # Jobs that write the SAME output column (the molecular mode=1 then
+        # mode=11 pair both target XNFP[:, col0]) are NOT disjoint, so running
+        # them on separate workers races. Group by (target array, col0) and run
+        # each group's jobs sequentially in append order within one worker --
+        # preserving the serial last-writer-wins result -- while distinct
+        # columns still run in parallel.
+        groups: dict = {}
+        order: list = []
+        for job in jobs:
+            key = (job.mode == 12, int(job.col0))
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(job)
+
+        def _run_group(key):
+            for job in groups[key]:
+                _run_popsall_job(
+                    job,
+                    temperature_k=temperature_k,
+                    tk_erg=tk_erg,
+                    state=state,
+                    ifmol=ifmol,
+                    ifpres=ifpres,
+                    itemp=itemp,
+                    itemp_cache=itemp_cache,
                 )
-            )
+
+        workers = min(pops_parallel_workers(), len(order))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(_run_group, order))
         return
 
     for job in jobs:

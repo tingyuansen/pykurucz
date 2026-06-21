@@ -583,12 +583,14 @@ def run_synthe_py(
 
     converter_script = _REPO_ROOT / "synthe_py" / "tools" / "convert_atm_to_npz.py"
     molecules_dat = _REPO_ROOT / "lines" / "molecules.dat"
+    continua_dat = _REPO_ROOT / "lines" / "continua.dat"
     cache_root = npz_cache_dir or default_npz_cache_dir(_REPO_ROOT)
     cache_key = npz_cache_key(
         atm_path=atm.resolve(),
         atlas_tables=atlas_tables,
         molecules=molecules_dat,
         converter_script=converter_script,
+        continua=continua_dat,
     )
     cached_npz = resolve_cached_npz(cache_root, cache_key)
 
