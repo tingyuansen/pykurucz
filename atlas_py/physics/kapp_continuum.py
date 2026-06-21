@@ -3218,16 +3218,22 @@ def compute_kapp_continuum(
                     reson1 = (-10e-18 * eps + 77e-18) / (eps**2 + 1.0)
                     x_si[23, m23] += (24.5e-18 * (59448.700 / wm) ** 1.85 + reson1) * weight
                 # Levels 24-26 (3P): two-part power law
-                for i, w_mult in [(24, 1.0), (25, 2.0), (26, 1.0)]:
+                # Reference (atlas12.for): level index 25 (Si I 3P1) takes a fixed
+                # 2/3 weight in BOTH the 2P1/2 and 2P3/2 channels; levels 24 (3P2)
+                # and 26 (3P0) scale with the channel weight (1/3 then 2/3). The
+                # factored `w_mult * weight` form doubled level 25 in the 2b
+                # channel (4/3 instead of 2/3) -- use the per-channel weight.
+                for i in (24, 25, 26):
                     mi = lyman_mask_si & (waveno >= elim_g - _si1_elev[i])
                     if np.any(mi):
                         wm = waveno[mi]
                         ratio = 65524.393 / wm
+                        eff_weight = (2.0 / 3.0) if i == 25 else weight
                         x_si[i, mi] += np.where(
                             wm <= 74000.0,
                             72e-18 * ratio ** 1.90,
                             93e-18 * ratio ** 4.00,
-                        ) * w_mult * weight
+                        ) * eff_weight
 
             # Group 3: levels 27-32 — XKARSAS (3, 1)
             elim3_si = 65747.5 + 42824.35

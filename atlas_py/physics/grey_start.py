@@ -169,6 +169,7 @@ def write_grey_atm_file(
     tau1lg: float = -6.875,
     steplg: float = 0.125,
     vturb_kms: float = 2.0,
+    title: str | None = None,
 ):
     """Generate a grey atmosphere and write it as a Kurucz ``.atm`` file.
 
@@ -196,6 +197,10 @@ def write_grey_atm_file(
         mh=mh,
         am=am,
         individual=abundances,
-        title=f"grey CALCULATE start (atlas12.for label 700) NRHOX={nrhox}",
+        title=(
+            title
+            if title is not None
+            else f"grey CALCULATE start (atlas12.for label 700) NRHOX={nrhox}"
+        ),
     )
     return dest

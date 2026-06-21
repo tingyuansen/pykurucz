@@ -45,18 +45,28 @@ pre-optimization `main`. Fair timing: warm cache, sequential, all 10 cores each.
   term (the T-only stop leaves P/RHOX further from settled), not a synthesis error.
 - **Memory** unchanged: ~280 MB private footprint per run.
 
-### Known follow-ups (minor; empirically negligible for optical spectra)
+### Correctness fixes applied on top of the optimized code
 
-Flagged during review for later cleanup — none affect the validated results above:
+Each was verified against the pre-optimization base and re-validated bit-identical
+for healthy stars (the far-UV / marginal items don't touch the 480–520 nm check):
 
-- `atlas_py/physics/kapp_continuum.py` — Si II level-25 photoionization
-  cross-section double-counted in the "Group-2b" block (affects λ ≲ 152 nm only).
-- `atlas_py/physics/selectlines.py` — hardcoded CENRATIO constant `0.014999`
-  vs exact `0.0149725` (over-includes marginal lines; never drops any).
-- `atlas_py/physics/grey_start.py` — emulator-fallback passes an unsupported
-  `title=` kwarg (`TypeError` on the rare non-physical-emulator path).
-- `atlas_py/engine/driver.py` — removed degenerate/NaN-atmosphere guards and an
-  unguarded `max()` over a possibly-empty metric set (robustness regression that
-  only manifests on a diverging atmosphere).
-- Opt-in only, off by default: `fort12` cache key omits abundances/logg/vturb;
-  `npz_cache` omits `continua.dat`; `ATLAS_POPS_PARALLEL=1` has data races.
+- `driver.py`, `hydrogen_profile.py`, `line_opacity.py` — restored the #1
+  cool-RSG / α-perturbed robustness guards the rewrite had silently dropped
+  (Fix 8a/8b/8c/8d/13/14: NaN/empty-`max` guards, all-NaN abort, degenerate-atm
+  write refusal, `_safe_f32` clip).
+- `atlas_py/physics/kapp_continuum.py` — Si I level-25 (3P1) photoionization
+  weight was `4/3` in the Si II 2P3/2 channel (a `w_mult * weight` refactor
+  artifact); restored to `2/3` to match atlas12.for. Affects continuum opacity
+  at λ ≲ 152 nm only.
+- `atlas_py/physics/selectlines.py` — the numba selection kernel hardcoded
+  CENRATIO `0.014999`; restored the exact `0.026538/1.77245 = 0.0149725` used by
+  the base and the pure-Python fallback (the kernel had over-included marginal
+  lines).
+- `atlas_py/physics/grey_start.py` — added the `title` parameter the
+  emulator-degenerate fallback already passes (was a latent `TypeError`).
+
+### Remaining follow-ups (opt-in, off by default — no effect on default runs)
+
+- `fort12` cache key omits abundances/logg/vturb; `npz_cache` omits
+  `continua.dat`; `ATLAS_POPS_PARALLEL=1` has data races. All inactive unless
+  explicitly enabled.

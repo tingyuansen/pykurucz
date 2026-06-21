@@ -37,7 +37,7 @@ except Exception:  # pragma: no cover - optional optimization dependency
 logger = logging.getLogger(__name__)
 
 # SELECTLINES constants from atlas12.for
-_CGF_SCALE = 0.026538 / 1.77245  # = 0.014999...
+_CGF_SCALE = 0.026538 / 1.77245  # = 0.0149725 (0.026538 / sqrt(pi))
 _RATIOLG = math.log(1.0 + 1.0 / 2_000_000.0)
 
 # MOLCODES and ISOX (atlas12.for lines 14487-14733)
@@ -148,7 +148,7 @@ if _NUMBA_AVAILABLE:
             f4 = freq4_per_bin[nu]
             if f4 <= 0.0:
                 f4 = np.float32(1.0e-37)
-            cr = np.float32(0.014999) * np.float32(tablog[igflog_clipped[i]]) * xnf / f4
+            cr = np.float32(0.026538 / 1.77245) * np.float32(tablog[igflog_clipped[i]]) * xnf / f4
             if cr < 1.0:
                 mask[i] = False
                 continue
@@ -217,7 +217,7 @@ if _NUMBA_AVAILABLE:
             f4 = freq4_per_bin[nu_i]
             if f4 <= 0.0:
                 f4 = np.float32(1.0e-37)
-            cr = np.float32(0.014999) * np.float32(tablog[kgf_idx]) * xnf / f4
+            cr = np.float32(0.026538 / 1.77245) * np.float32(tablog[kgf_idx]) * xnf / f4
             if cr < 1.0:
                 mask[i] = False
                 continue
