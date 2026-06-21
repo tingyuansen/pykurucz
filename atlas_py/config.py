@@ -51,4 +51,14 @@ class AtlasConfig:
     convergence_epsilon: Optional[float] = None
     convergence_min_iterations: int = 5
     convergence_consecutive: int = 1
+    # Deep-layer temperature stop threshold for the Fortran checkconv.f90
+    # criterion (MAXVAL(|dT/T|, layers 40..jmax-5) < dlntmax). Fortran uses
+    # 1e-4; the validated production default loosens this to 5e-4 (see
+    # results/convergence_criteria/REPORT.md). Set to 1e-4 for Fortran parity.
+    convergence_dlntmax: float = 5.0e-4
+    n_workers: Optional[int] = None
+    cache_dir: Optional[Path] = None
+    linop1_serial: Optional[bool] = None
+    convec_fd_parallel: Optional[bool] = None
+    pops_parallel: Optional[bool] = None
 

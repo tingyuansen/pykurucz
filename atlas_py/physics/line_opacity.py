@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import logging
+import multiprocessing
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -59,6 +63,8 @@ def _subset_xline_records(records: XLineRecords, mask: np.ndarray) -> XLineRecor
 _RATIOLG = np.log(1.0 + 1.0 / 2_000_000.0)
 _CGF_SCALE = 0.026538 / 1.77245 / 2.99792458e17
 _GAMMA_SCALE = 1.0 / 12.5664 / 2.99792458e17
+_LINOP1_CHUNK_MIN_RECORDS = 500_000
+_LINOP1_CHUNK_TARGET = 250_000
 
 _LO_TABLES = _load_lo_tables()
 _TABVI = _LO_TABLES["_TABVI"]
@@ -101,6 +107,40 @@ def _build_tablog() -> np.ndarray:
 def _build_exptab() -> tuple[np.ndarray, np.ndarray]:
     i = np.arange(1001, dtype=np.float64)
     return np.exp(-i), np.exp(-i * 0.001)
+
+
+@lru_cache(maxsize=1)
+def _build_exptab_f32() -> tuple[np.ndarray, np.ndarray]:
+    extab, extabf = _build_exptab()
+    return extab.astype(np.float32, copy=False), extabf.astype(np.float32, copy=False)
+
+
+@lru_cache(maxsize=1)
+def _build_tablog_f32() -> np.ndarray:
+    return np.asarray(_build_tablog(), dtype=np.float32)
+
+
+@lru_cache(maxsize=1)
+def _build_h_tables_f32() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    h0, h1, h2 = _build_h_tables()
+    return (
+        h0.astype(np.float32, copy=False),
+        h1.astype(np.float32, copy=False),
+        h2.astype(np.float32, copy=False),
+    )
+
+
+def _as_contiguous_f32(arr: np.ndarray) -> np.ndarray:
+    """Return C-contiguous float32 view without copy when possible."""
+    if arr.dtype == np.float32 and arr.flags.c_contiguous:
+        return arr
+    return np.ascontiguousarray(arr, dtype=np.float32)
+
+
+def _as_contiguous_f64(arr: np.ndarray) -> np.ndarray:
+    if arr.dtype == np.float64 and arr.flags.c_contiguous:
+        return arr
+    return np.ascontiguousarray(arr, dtype=np.float64)
 
 
 def _map4(xold: np.ndarray, fold: np.ndarray, xnew: np.ndarray) -> np.ndarray:
@@ -195,12 +235,8 @@ def _build_h_tables() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def _fastex(x: float, extab: np.ndarray, extabf: np.ndarray) -> float:
-    # Guard NaN/inf: a non-finite x can arrive here when an upstream
-    # divergence (TCORR overshoot, hydrostatic floor) leaves stray
-    # non-finite values in the column.  Returning 0 is the safe choice
-    # (no contribution from this layer/line for this iteration); the
-    # convergence monitor in driver.py will catch a genuinely runaway
-    # column on the next pass.
+    # Fix 8b (#1 robustness): a non-finite x (from an upstream divergence) must
+    # return 0 here -- int(NaN) raises and a leaked NaN poisons the wing sum.
     if not np.isfinite(x) or x < 0.0 or x >= 1001.0:
         return 0.0
     i = int(x)
@@ -347,7 +383,151 @@ def _accumulate_wings(
             break
 
 
+_logger = logging.getLogger(__name__)
+_FASTEX_MONOTONIC_CHECKED = False
 
+
+@dataclass
+class _Linop1ScalarCache:
+    """Per-record scalars invariant across ATLAS iterations (same fort.12)."""
+
+    wlvac_arr: np.ndarray
+    wlvac4_arr: np.ndarray
+    cgf_arr: np.ndarray
+    elo_log_arr: np.ndarray
+    gammar_arr: np.ndarray
+    gammas_arr: np.ndarray
+    gammaw_arr: np.ndarray
+    line_valid: np.ndarray
+
+
+_linop1_scalar_cache_store: dict[int, _Linop1ScalarCache] = {}
+
+
+def _available_ram_bytes() -> int:
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        return int(pages * page_size)
+    except (ValueError, AttributeError, OSError):
+        return 16_000_000_000
+
+
+def _linop1_cache_line_scalars_enabled(n_records: int) -> bool:
+    env = os.environ.get("ATLAS_LINOP1_CACHE_LINE_SCALARS", "1")
+    if env == "0":
+        return False
+    bytes_needed = n_records * (8 + 4 * 6 + 1)
+    if bytes_needed > _available_ram_bytes() * 0.5:
+        _logger.warning(
+            "LINOP1 scalar cache disabled: need %.1f GB, >50%% of RAM",
+            bytes_needed / 1e9,
+        )
+        return False
+    return True
+
+
+def _get_linop1_scalar_cache(
+    records: SelectedLineRecords,
+    tablog: np.ndarray,
+) -> _Linop1ScalarCache | None:
+    n_records = int(records.size)
+    if not _linop1_cache_line_scalars_enabled(n_records):
+        return None
+    key = id(records.iwl)
+    cached = _linop1_scalar_cache_store.get(key)
+    if cached is not None:
+        return cached
+
+    _t0 = time.perf_counter()
+    iwl_arr = np.asarray(records.iwl, dtype=np.float64)
+    igflog_arr = np.asarray(records.igflog, dtype=np.int16)
+    ielo_arr = np.asarray(records.ielo, dtype=np.int16)
+    igr_arr = np.asarray(records.igr, dtype=np.int16)
+    igs_arr = np.asarray(records.igs, dtype=np.int16)
+    igw_arr = np.asarray(records.igw, dtype=np.int16)
+
+    wlvac_arr = np.exp(iwl_arr * _RATIOLG)
+    wlvac4_arr = wlvac_arr.astype(np.float32, copy=False)
+    tl = int(tablog.shape[0])
+
+    line_valid = (
+        (igflog_arr >= 1)
+        & (ielo_arr >= 1)
+        & (igr_arr >= 1)
+        & (igs_arr >= 1)
+        & (igw_arr >= 1)
+        & (igflog_arr <= tl)
+        & (ielo_arr <= tl)
+        & (igr_arr <= tl)
+        & (igs_arr <= tl)
+        & (igw_arr <= tl)
+    ).astype(np.uint8)
+
+    cgf_scale = np.float32(_CGF_SCALE)
+    gamma_scale = np.float32(_GAMMA_SCALE)
+    igflog_idx = np.clip(igflog_arr.astype(np.int64) - 1, 0, tl - 1)
+    cgf_arr = (cgf_scale * wlvac4_arr * tablog[igflog_idx]).astype(np.float32, copy=False)
+    cgf_arr[~line_valid.astype(bool)] = np.float32(0.0)
+
+    elo_idx = np.clip(ielo_arr.astype(np.int64) - 1, 0, tl - 1)
+    elo_log_arr = tablog[elo_idx].astype(np.float32, copy=False)
+
+    igr_idx = np.clip(igr_arr.astype(np.int64) - 1, 0, tl - 1)
+    igs_idx = np.clip(igs_arr.astype(np.int64) - 1, 0, tl - 1)
+    igw_idx = np.clip(igw_arr.astype(np.int64) - 1, 0, tl - 1)
+    gammar_arr = (tablog[igr_idx] * wlvac4_arr * gamma_scale).astype(np.float32, copy=False)
+    gammas_arr = (tablog[igs_idx] * wlvac4_arr * gamma_scale).astype(np.float32, copy=False)
+    gammaw_arr = (tablog[igw_idx] * wlvac4_arr * gamma_scale).astype(np.float32, copy=False)
+
+    cached = _Linop1ScalarCache(
+        wlvac_arr=wlvac_arr,
+        wlvac4_arr=wlvac4_arr,
+        cgf_arr=cgf_arr,
+        elo_log_arr=elo_log_arr,
+        gammar_arr=gammar_arr,
+        gammas_arr=gammas_arr,
+        gammaw_arr=gammaw_arr,
+        line_valid=line_valid,
+    )
+    _linop1_scalar_cache_store[key] = cached
+    _logger.info(
+        "LINOP1 scalar cache built: %d records, %.1f MB, %.3fs",
+        n_records,
+        (n_records * 33) / 1e6,
+        time.perf_counter() - _t0,
+    )
+    return cached
+
+
+def _assert_fastex_monotonic() -> None:
+    global _FASTEX_MONOTONIC_CHECKED
+    if _FASTEX_MONOTONIC_CHECKED:
+        return
+    extab, extabf = _build_exptab()
+    xs = np.linspace(0.0, 1000.0, 10001, dtype=np.float64)
+    vals = np.empty(xs.shape[0], dtype=np.float64)
+    for k, x in enumerate(xs):
+        vals[k] = _fastex(float(x), extab, extabf)
+    if not np.all(np.diff(vals) <= 1e-15):
+        raise RuntimeError("_fastex is not monotonically decreasing on [0, 1000]")
+    _FASTEX_MONOTONIC_CHECKED = True
+
+
+def _dummy_f32() -> np.ndarray:
+    return np.zeros(1, dtype=np.float32)
+
+
+def _dummy_f64() -> np.ndarray:
+    return np.zeros(1, dtype=np.float64)
+
+
+def _dummy_u8() -> np.ndarray:
+    return np.zeros(1, dtype=np.uint8)
+
+
+def _dummy_i64() -> np.ndarray:
+    return np.zeros(5, dtype=np.int64)
 
 
 # ---------------------------------------------------------------------------
@@ -356,26 +536,37 @@ def _accumulate_wings(
 # ---------------------------------------------------------------------------
 
 if _NUMBA_AVAILABLE:
-    _njit = numba.njit(cache=True)
-    _njit_parallel = numba.njit(cache=True, parallel=True)
+    _njit = numba.njit(cache=True, nogil=True)
+    _njit_parallel = numba.njit(cache=True, parallel=True, nogil=True)
+    # Inlined variant for the small LINOP1 lookup helpers (fastex/voigt). These
+    # are tiny and benefit from inlining at their many call sites; the larger
+    # wing accumulator is intentionally NOT force-inlined (it bloated the kernel
+    # and regressed throughput).
+    _njit_inline = numba.njit(cache=True, nogil=True, inline="always")
 
-    @_njit
+    @_njit_inline
     def _fastex_nb(x, extab, extabf):
-        # Guard NaN/inf: numba's int(NaN) raises ValueError inside the JIT,
-        # so explicitly bail out for non-finite x.  Returning 0 corresponds
-        # to "no opacity contribution from this layer this iteration",
-        # which lets the iteration recover.
+        # Returns float32 unconditionally. The Fortran EXP10 lookup is REAL*4,
+        # and the zero-branch must NOT leak a Python float (float64): doing so
+        # makes Numba unify _fastex_nb's return type to float64, which then
+        # poisons `center = center * _fastex_nb(...)` to float64 and forces the
+        # entire LINOP1 wing accumulator (~1.3B steps/iter on cool stars) into
+        # double precision with f32<->f64 conversions on every step. Keeping it
+        # float32 lets the wing path stay single-precision like Fortran.
+        # Fix 8b (#1 robustness): numba int(NaN) raises inside the JIT; bail to 0
+        # for non-finite x (x != x detects NaN). Keep the np.float32 return so the
+        # wing kernel stays single-precision (see the type-unification note above).
         if not (x == x) or x < 0.0 or x >= 1001.0:
-            return 0.0
+            return np.float32(0.0)
         i = int(x)
         j = int((x - float(i)) * 1000.0 + 1.5)
         if j < 1:
             j = 1
         if j > 1001:
             j = 1001
-        return extab[i] * extabf[j - 1]
+        return np.float32(extab[i] * extabf[j - 1])
 
-    @_njit
+    @_njit_inline
     def _voigt_nb(v, a, h0, h1, h2):
         iv = int(v * 200.0 + 1.5)
         if iv < 1:
@@ -409,12 +600,21 @@ if _NUMBA_AVAILABLE:
             return 0.5642 * a / (v * v)
         return (h2[i] * a + h1[i]) * a + h0[i]
 
-    @_njit
+    @numba.njit(cache=True, nogil=True, fastmath=True)
     def _accwings_nb(xlines, j0, nu0, wlvac, center, adamp, dopwave, tabcont_ref, waveset, h0tab, h1tab, h2tab):
         """_accumulate_wings without blue_cutoff (linop1 never sets it).
 
         Fortran LINOP1 uses IMPLICIT REAL*4 — all intermediates (VVOIGT, CV)
         are float32.  VVOIGT = SNGL(WAVESET-WLVAC)/DOPWAVE.
+
+        ``fastmath=True`` is set on this function specifically (not the
+        rest of the module). The wing accumulator runs ~1.3B times per
+        ATLAS iter on cool stars; it is the LINOP1 hot path. fastmath
+        lets Numba/LLVM substitute reciprocal approximations for the
+        per-step ``/dopwave`` divide and FMA-fuse the Horner Voigt
+        polynomial. The numerical drift is < 1 ULP per step (xlines
+        accumulator is float32, so sub-ULP error stays below storage
+        precision). Fortran source: atlas12.for ACCWINGS subroutine.
         """
         numnu = waveset.shape[0]
         if dopwave <= 0.0:
@@ -426,7 +626,7 @@ if _NUMBA_AVAILABLE:
             for iw in range(nu0, ired_hi):
                 vvoigt = np.float32(waveset[iw] - wlvac) / dopwave
                 if vvoigt > np.float32(10.0):
-                    cv = center * f32_5642 * adamp / (vvoigt * vvoigt)
+                    cv = np.float32(center * f32_5642 * adamp / (vvoigt * vvoigt))
                 else:
                     iv = int(vvoigt * np.float32(200.0) + np.float32(1.5))
                     if iv < 1:
@@ -434,7 +634,7 @@ if _NUMBA_AVAILABLE:
                     if iv > 2001:
                         iv = 2001
                     ii = iv - 1
-                    cv = center * ((h2tab[ii] * adamp + h1tab[ii]) * adamp + h0tab[ii])
+                    cv = np.float32(center * ((h2tab[ii] * adamp + h1tab[ii]) * adamp + h0tab[ii]))
                 xlines[j0, iw] += cv
                 if cv < tabcont_ref:
                     break
@@ -444,7 +644,7 @@ if _NUMBA_AVAILABLE:
                     break
                 vvoigt = np.float32(wlvac - waveset[iw]) / dopwave
                 if vvoigt > np.float32(10.0):
-                    cv = center * f32_5642 * adamp / (vvoigt * vvoigt)
+                    cv = np.float32(center * f32_5642 * adamp / (vvoigt * vvoigt))
                 else:
                     iv = int(vvoigt * np.float32(200.0) + np.float32(1.5))
                     if iv < 1:
@@ -452,7 +652,7 @@ if _NUMBA_AVAILABLE:
                     if iv > 2001:
                         iv = 2001
                     ii = iv - 1
-                    cv = center * ((h2tab[ii] * adamp + h1tab[ii]) * adamp + h0tab[ii])
+                    cv = np.float32(center * ((h2tab[ii] * adamp + h1tab[ii]) * adamp + h0tab[ii]))
                 xlines[j0, iw] += cv
                 if cv < tabcont_ref:
                     break
@@ -470,6 +670,34 @@ if _NUMBA_AVAILABLE:
             xlines[j0, iw] += cv
             if cv < tabcont_ref:
                 break
+
+    @_njit
+    def _tab_col_min_nb(tab: np.ndarray) -> np.ndarray:
+        nrows = tab.shape[0]
+        ncols = tab.shape[1]
+        out = np.empty(ncols, dtype=np.float32)
+        for k in range(ncols):
+            m = tab[0, k]
+            for j in range(1, nrows):
+                v = tab[j, k]
+                if v < m:
+                    m = v
+            out[k] = m
+        return out
+
+    @_njit
+    def _max_xnfdop_col_nb(xnfdop_arr: np.ndarray) -> np.ndarray:
+        nrows = xnfdop_arr.shape[0]
+        ncols = xnfdop_arr.shape[1]
+        out = np.empty(ncols, dtype=np.float32)
+        for k in range(ncols):
+            m = xnfdop_arr[0, k]
+            for j in range(1, nrows):
+                v = xnfdop_arr[j, k]
+                if v > m:
+                    m = v
+            out[k] = m
+        return out
 
     @_njit
     def _accwings_cutoff_nb(
@@ -535,6 +763,30 @@ if _NUMBA_AVAILABLE:
                 break
 
     @_njit
+    def _linop1_prefilter_skip_nb(
+        cgf,
+        nelion,
+        nucont0,
+        tab_col_min,
+        max_xnfdop_arr,
+        elo_val,
+        min_hckt,
+        extab,
+        extabf,
+        use_tight,
+    ):
+        """Exact-safe reject for LINOP1 line records.
+
+        When ``use_tight == 0``: peak pre-fastex center < min tab at nucont0.
+        When ``use_tight == 1``: also multiply by fastex(elo * min_hckt), which
+        is an upper bound on fastex(elo * hckt[j]) for all j (fastex decreases).
+        """
+        peak = cgf * max_xnfdop_arr[nelion - 1]
+        if use_tight != 0:
+            peak = peak * _fastex_nb(elo_val * min_hckt, extab, extabf)
+        return peak < tab_col_min[nucont0]
+
+    @_njit
     def _linop1_kernel_nb(
         n_records,
         iwl_arr, ielion_arr, ielo_arr, igflog_arr, igr_arr, igs_arr, igw_arr,
@@ -545,16 +797,134 @@ if _NUMBA_AVAILABLE:
         nrhox, numnu, nuhi_eff, nulo,
         start, stop,
         ratiolg, cgf_scale, gamma_scale,
+        tab_col_min,
+        max_xnfdop_arr,
+        use_prefilter,
+        use_cached,
+        wlvac_arr, wlvac4_arr, cgf_arr, elo_log_arr,
+        gammar_arr, gammas_arr, gammaw_arr, line_valid,
+        min_hckt, use_tight_prefilter,
+        xlines_out, reuse_buffer,
     ):
-        xlines = np.zeros((nrhox, numnu), dtype=np.float32)
-        ifj = np.zeros(nrhox + 2, dtype=np.int32)
+        return _linop1_kernel_nb_chunk(
+            0,
+            n_records,
+            max(0, nulo - 1),
+            0,
+            0,
+            n_records,
+            iwl_arr, ielion_arr, ielo_arr, igflog_arr, igr_arr, igs_arr, igw_arr,
+            waveset, iwavetab, tab,
+            hckt_arr, xne_arr, xnfdop_arr, dopple_arr, txnxn,
+            extab, extabf, tablog,
+            h0tab, h1tab, h2tab,
+            nrhox, numnu, nuhi_eff, nulo,
+            start, stop,
+            ratiolg, cgf_scale, gamma_scale,
+            tab_col_min,
+            max_xnfdop_arr,
+            use_prefilter,
+            use_cached,
+            wlvac_arr, wlvac4_arr, cgf_arr, elo_log_arr,
+            gammar_arr, gammas_arr, gammaw_arr, line_valid,
+            min_hckt, use_tight_prefilter,
+            xlines_out, reuse_buffer,
+        )
 
+    @_njit
+    def _linop1_scan_boundaries_nb(
+        n_records,
+        iwl_arr,
+        iwavetab,
+        waveset,
+        nulo,
+        start,
+        stop,
+        ratiolg,
+        chunk_starts,
+        use_cached,
+        wlvac_arr,
+    ):
+        """Record (nu0, nucont0, iwlold) at each chunk start index."""
+        n_chunks = chunk_starts.shape[0]
+        nu0_st = np.zeros(n_chunks, dtype=np.int64)
+        nucont0_st = np.zeros(n_chunks, dtype=np.int64)
+        iwlold_st = np.zeros(n_chunks, dtype=np.int64)
+        numnu = waveset.shape[0]
         nucont0 = 0
         nu0 = max(0, nulo - 1)
         iwlold = 0
-        lineused = 0
-
+        chunk_idx = 0
+        if n_chunks > 0:
+            nu0_st[0] = nu0
+            nucont0_st[0] = nucont0
+            iwlold_st[0] = iwlold
         for iline in range(n_records):
+            if chunk_idx + 1 < n_chunks and iline == int(chunk_starts[chunk_idx + 1]):
+                chunk_idx += 1
+                nu0_st[chunk_idx] = nu0
+                nucont0_st[chunk_idx] = nucont0
+                iwlold_st[chunk_idx] = iwlold
+            iwl = int(iwl_arr[iline])
+            if iwl < iwlold:
+                nucont0 = 0
+                nu0 = max(0, nulo - 1)
+            while nucont0 < iwavetab.shape[0] and iwl >= int(iwavetab[nucont0]):
+                nucont0 += 1
+            if nucont0 >= iwavetab.shape[0]:
+                iwlold = iwl
+                continue
+            if use_cached != 0:
+                wlvac = wlvac_arr[iline]
+            else:
+                wlvac = np.exp(float(iwl) * ratiolg)
+            if wlvac < start or wlvac > stop:
+                iwlold = iwl
+                continue
+            while nu0 < numnu and wlvac >= waveset[nu0]:
+                nu0 += 1
+            iwlold = iwl
+        return nu0_st, nucont0_st, iwlold_st
+
+    @_njit
+    def _linop1_kernel_nb_chunk(
+        iline_start,
+        iline_end,
+        init_nu0,
+        init_nucont0,
+        init_iwlold,
+        n_records,
+        iwl_arr, ielion_arr, ielo_arr, igflog_arr, igr_arr, igs_arr, igw_arr,
+        waveset, iwavetab, tab,
+        hckt_arr, xne_arr, xnfdop_arr, dopple_arr, txnxn,
+        extab, extabf, tablog,
+        h0tab, h1tab, h2tab,
+        nrhox, numnu, nuhi_eff, nulo,
+        start, stop,
+        ratiolg, cgf_scale, gamma_scale,
+        tab_col_min,
+        max_xnfdop_arr,
+        use_prefilter,
+        use_cached,
+        wlvac_arr, wlvac4_arr, cgf_arr, elo_log_arr,
+        gammar_arr, gammas_arr, gammaw_arr, line_valid,
+        min_hckt, use_tight_prefilter,
+        xlines_out, reuse_buffer,
+    ):
+        if reuse_buffer != 0:
+            xlines = xlines_out
+            xlines.fill(np.float32(0.0))
+        else:
+            xlines = np.zeros((nrhox, numnu), dtype=np.float32)
+        ifj = np.zeros(nrhox + 2, dtype=np.int32)
+        nucont0 = int(init_nucont0)
+        nu0 = int(init_nu0)
+        iwlold = int(init_iwlold)
+        lineused = 0
+        iline_start = max(0, int(iline_start))
+        iline_end = min(int(iline_end), int(n_records))
+
+        for iline in range(iline_start, iline_end):
             iwl = int(iwl_arr[iline])
             if iwl < iwlold:
                 nucont0 = 0
@@ -571,11 +941,16 @@ if _NUMBA_AVAILABLE:
                 iwlold = iwl
                 continue
 
-            wlvac = np.exp(float(iwl) * ratiolg)
+            if use_cached != 0:
+                wlvac = wlvac_arr[iline]
+                wlvac4 = wlvac4_arr[iline]
+            else:
+                wlvac = np.exp(float(iwl) * ratiolg)
+                wlvac4 = np.float32(wlvac)
+
             if wlvac < start or wlvac > stop:
                 iwlold = iwl
                 continue
-            wlvac4 = np.float32(wlvac)
 
             while nu0 < numnu and wlvac >= waveset[nu0]:
                 nu0 += 1
@@ -583,26 +958,41 @@ if _NUMBA_AVAILABLE:
                 iwlold = iwl
                 continue
 
-            igflog = int(igflog_arr[iline])
-            ielo = int(ielo_arr[iline])
-            igr_v = int(igr_arr[iline])
-            igs_v = int(igs_arr[iline])
-            igw_v = int(igw_arr[iline])
-            if igflog < 1 or ielo < 1 or igr_v < 1 or igs_v < 1 or igw_v < 1:
-                iwlold = iwl
-                continue
-            tl = tablog.shape[0]
-            if igflog > tl or ielo > tl or igr_v > tl or igs_v > tl or igw_v > tl:
-                iwlold = iwl
-                continue
+            if use_cached != 0:
+                if line_valid[iline] == 0:
+                    iwlold = iwl
+                    continue
+                cgf = cgf_arr[iline]
+                elo_val = elo_log_arr[iline]
+            else:
+                igflog = int(igflog_arr[iline])
+                ielo = int(ielo_arr[iline])
+                igr_v = int(igr_arr[iline])
+                igs_v = int(igs_arr[iline])
+                igw_v = int(igw_arr[iline])
+                if igflog < 1 or ielo < 1 or igr_v < 1 or igs_v < 1 or igw_v < 1:
+                    iwlold = iwl
+                    continue
+                tl = tablog.shape[0]
+                if igflog > tl or ielo > tl or igr_v > tl or igs_v > tl or igw_v > tl:
+                    iwlold = iwl
+                    continue
+                cgf = cgf_scale * wlvac4 * tablog[igflog - 1]
+                elo_val = tablog[ielo - 1]
 
-            cgf = cgf_scale * wlvac4 * tablog[igflog - 1]
-            elo_val = tablog[ielo - 1]
+            if use_prefilter:
+                if _linop1_prefilter_skip_nb(
+                    cgf, nelion, nucont0, tab_col_min, max_xnfdop_arr,
+                    elo_val, min_hckt, extab, extabf, use_tight_prefilter,
+                ):
+                    iwlold = iwl
+                    continue
+
             ifline = 0
             adamp_seed = 0.0
-            gammar = 0.0
-            gammas = 0.0
-            gammaw = 0.0
+            gammar = np.float32(0.0)
+            gammas = np.float32(0.0)
+            gammaw = np.float32(0.0)
 
             for j1 in range(8, nrhox + 1, 8):
                 ifj[j1 + 1] = 0
@@ -616,9 +1006,14 @@ if _NUMBA_AVAILABLE:
                 ifj[j1 + 1] = 1
                 ifline = 1
                 if adamp_seed == 0.0:
-                    gammar = tablog[igr_v - 1] * wlvac4 * gamma_scale
-                    gammas = tablog[igs_v - 1] * wlvac4 * gamma_scale
-                    gammaw = tablog[igw_v - 1] * wlvac4 * gamma_scale
+                    if use_cached != 0:
+                        gammar = gammar_arr[iline]
+                        gammas = gammas_arr[iline]
+                        gammaw = gammaw_arr[iline]
+                    else:
+                        gammar = tablog[int(igr_arr[iline]) - 1] * wlvac4 * gamma_scale
+                        gammas = tablog[int(igs_arr[iline]) - 1] * wlvac4 * gamma_scale
+                        gammaw = tablog[int(igw_arr[iline]) - 1] * wlvac4 * gamma_scale
                     adamp_seed = 1.0
                 dop = dopple_arr[j0, nelion - 1]
                 if dop <= 0.0:
@@ -644,6 +1039,16 @@ if _NUMBA_AVAILABLE:
                     dop = dopple_arr[j0, nelion - 1]
                     if dop <= 0.0:
                         continue
+                    if adamp_seed == 0.0:
+                        if use_cached != 0:
+                            gammar = gammar_arr[iline]
+                            gammas = gammas_arr[iline]
+                            gammaw = gammaw_arr[iline]
+                        else:
+                            gammar = tablog[int(igr_arr[iline]) - 1] * wlvac4 * gamma_scale
+                            gammas = tablog[int(igs_arr[iline]) - 1] * wlvac4 * gamma_scale
+                            gammaw = tablog[int(igw_arr[iline]) - 1] * wlvac4 * gamma_scale
+                        adamp_seed = 1.0
                     adamp = (gammar + gammas * xne_arr[j0] + gammaw * txnxn[j0]) / dop
                     dopwave = dop * wlvac4
                     _accwings_nb(
@@ -1187,6 +1592,8 @@ def linop1(
     dopple: np.ndarray,
     nulo: int = 1,
     nuhi: int | None = None,
+    xlines_buf: np.ndarray | None = None,
+    chunk_bufs: list[np.ndarray] | None = None,
 ) -> LineOpacityState:
     """Fortran-faithful LINOP1 accumulation from preselected `fort.12` records.
 
@@ -1194,51 +1601,57 @@ def linop1(
     speed; otherwise falls back to a pure-Python loop.
     """
 
-    waveset = np.asarray(wave_set_nm, dtype=np.float64)
-    iwavetab = np.asarray(i_wavetab, dtype=np.int64)
+    waveset = _as_contiguous_f64(wave_set_nm)
+    iwavetab = np.ascontiguousarray(i_wavetab, dtype=np.int64)
+    use_linop1_f32 = os.environ.get("ATLAS_LINOP1_FLOAT32", "1") != "0"
     # Fortran LINOP1 uses IMPLICIT REAL*4: TABCONT, XNFDOP, DOPPLE, HCKT4,
     # XNE4 are all REAL*4.  Keep WAVESET as float64 (Fortran REAL*8).
-    # Fix 8d (2026-05-03): clip non-finite or extreme values that overflow
-    # the float32 cast.  Real stellar XNE never exceeds ~1e20 cm^-3, so a
-    # ceiling of 1e30 is far above any physical value while comfortably
-    # below the float32 max (~3.4e38).  Without this clip, a single
-    # diverging atmosphere iteration produces inf/NaN in the cast and
-    # propagates through the entire LINOP/RT chain, poisoning the
-    # next iteration's atmosphere and producing the silent-NaN
-    # convergence failure documented in PYKURUCZ_FIXES.md Fix 8a.
+    # Fix 8d (#1 cool-RSG robustness): clip non-finite/extreme values before the
+    # REAL*4 cast. A single diverging iteration can leave inf/NaN in these
+    # columns; without this the float32 cast propagates inf/NaN through the whole
+    # LINOP/RT chain and poisons the next atmosphere (PYKURUCZ_FIXES.md Fix 8a).
+    # No-op for finite values, so healthy runs stay bit-identical.
     def _safe_f32(arr, ceiling: float = 1e30):
         a = np.asarray(arr, dtype=np.float64)
         a = np.where(np.isfinite(a), a, 0.0)
         a = np.clip(a, -ceiling, ceiling)
-        return a.astype(np.float32)
+        return np.ascontiguousarray(a, dtype=np.float32)
+
+    def _safe_f64(arr):
+        a = np.asarray(arr, dtype=np.float64)
+        return np.ascontiguousarray(np.where(np.isfinite(a), a, 0.0))
 
     tab = _safe_f32(tabcont)
-    t = np.asarray(temperature_k, dtype=np.float64)
+    t = _as_contiguous_f64(temperature_k)
     t = np.where(np.isfinite(t) & (t > 0.0), t, 1.0)
-    hckt_arr = _safe_f32(hckt, ceiling=1e10)
-    xne_arr = _safe_f32(xne, ceiling=1e30)
-    xnf_arr = np.asarray(xnf, dtype=np.float64)
-    xnf_arr = np.where(np.isfinite(xnf_arr), xnf_arr, 0.0)
-    xnfdop_arr = _safe_f32(xnfdop)
-    dopple_arr = _safe_f32(dopple, ceiling=1e10)
-
+    if use_linop1_f32:
+        hckt_arr = _safe_f32(hckt, ceiling=1e10)
+        xne_arr = _safe_f32(xne, ceiling=1e30)
+        xnfdop_arr = _safe_f32(xnfdop)
+        dopple_arr = _safe_f32(dopple, ceiling=1e10)
+        extab, extabf = _build_exptab_f32()
+        tablog = _build_tablog_f32()
+        h0tab, h1tab, h2tab = _build_h_tables_f32()
+    else:
+        hckt_arr = _safe_f64(hckt)
+        xne_arr = _safe_f64(xne)
+        xnfdop_arr = _safe_f64(xnfdop)
+        dopple_arr = _safe_f64(dopple)
+        extab, extabf = _build_exptab()
+        extab = np.asarray(extab, dtype=np.float64)
+        extabf = np.asarray(extabf, dtype=np.float64)
+        tablog = np.asarray(_build_tablog(), dtype=np.float64)
+        h0tab, h1tab, h2tab = _build_h_tables()
     nrhox = int(t.size)
     numnu = int(waveset.size)
     nuhi_eff = numnu if nuhi is None else int(nuhi)
     if nrhox != 80:
         raise ValueError(f"LINOP1 expects 80 depth layers, got {nrhox}")
 
-    extab, extabf = _build_exptab()
-    extab = np.asarray(extab, dtype=np.float32)
-    extabf = np.asarray(extabf, dtype=np.float32)
-    tablog = np.asarray(_build_tablog(), dtype=np.float32)
-    h0tab, h1tab, h2tab = _build_h_tables()
-    h0tab = np.asarray(h0tab, dtype=np.float32)
-    h1tab = np.asarray(h1tab, dtype=np.float32)
-    h2tab = np.asarray(h2tab, dtype=np.float32)
-
-    # Fortran: TXNXN is REAL*4 (line 9950), computed from REAL*8 then truncated
-    # Fix 8d: same clip pattern as above to keep cast finite.
+    xnf_arr = _as_contiguous_f64(xnf)
+    xnf_arr = np.ascontiguousarray(np.where(np.isfinite(xnf_arr), xnf_arr, 0.0))
+    # Fortran: TXNXN is REAL*4 (line 9950), computed from REAL*8 then truncated.
+    # Fix 8d: same clip pattern + t floor so the cast stays finite.
     _txnxn_full = (
         xnf_arr[:, 0] + 0.42 * xnf_arr[:, 2] + 0.85 * xnf_arr[:, 840]
     ) * (np.maximum(t, 1.0) / 10000.0) ** 0.3
@@ -1247,24 +1660,210 @@ def linop1(
     stop = float(waveset[min(nuhi_eff, numnu) - 1] + 1.0)
 
     force_py_linop1 = os.environ.get("ATLAS_TRACE_FORCE_PY_LINOP1", "0") == "1"
+    force_serial_linop1 = os.environ.get("ATLAS_LINOP1_SERIAL", "0") == "1"
     if _NUMBA_AVAILABLE and not force_py_linop1:
-        xlines, lineused = _linop1_kernel_nb(
-            records.size,
-            np.asarray(records.iwl, dtype=np.int32),
-            np.asarray(records.ielion, dtype=np.int16),
-            np.asarray(records.ielo, dtype=np.int16),
-            np.asarray(records.igflog, dtype=np.int16),
-            np.asarray(records.igr, dtype=np.int16),
-            np.asarray(records.igs, dtype=np.int16),
-            np.asarray(records.igw, dtype=np.int16),
-            waveset, iwavetab, tab,
-            hckt_arr, xne_arr, xnfdop_arr, dopple_arr, txnxn,
-            extab, extabf, tablog,
-            h0tab, h1tab, h2tab,
-            nrhox, numnu, nuhi_eff, nulo,
-            start, stop,
-            float(_RATIOLG), np.float32(_CGF_SCALE), np.float32(_GAMMA_SCALE),
+        n_records = int(records.size)
+        iwl_arr = np.asarray(records.iwl, dtype=np.int32)
+        ielion_arr = np.asarray(records.ielion, dtype=np.int16)
+        ielo_arr = np.asarray(records.ielo, dtype=np.int16)
+        igflog_arr = np.asarray(records.igflog, dtype=np.int16)
+        igr_arr = np.asarray(records.igr, dtype=np.int16)
+        igs_arr = np.asarray(records.igs, dtype=np.int16)
+        igw_arr = np.asarray(records.igw, dtype=np.int16)
+        ratiolg = float(_RATIOLG)
+        cgf_scale = np.float32(_CGF_SCALE)
+        gamma_scale = np.float32(_GAMMA_SCALE)
+
+        use_linop1_prefilter = os.environ.get("ATLAS_LINOP1_PREFILTER", "1") != "0"
+        prefilter_flag = 1 if use_linop1_prefilter else 0
+        if use_linop1_prefilter:
+            if use_linop1_f32:
+                tab_col_min = _tab_col_min_nb(tab)
+                max_xnfdop_arr = _max_xnfdop_col_nb(xnfdop_arr)
+            else:
+                tab_col_min = np.min(tab, axis=0).astype(np.float32, copy=False)
+                max_xnfdop_arr = np.max(xnfdop_arr, axis=0).astype(np.float32, copy=False)
+        else:
+            tab_col_min = np.zeros(1, dtype=np.float32)
+            max_xnfdop_arr = np.zeros(1, dtype=np.float32)
+
+        _assert_fastex_monotonic()
+        use_tight_prefilter = int(
+            os.environ.get("ATLAS_LINOP1_TIGHT_PREFILTER", "1") != "0"
         )
+        min_hckt = np.float32(np.min(hckt_arr))
+
+        scalar_cache = _get_linop1_scalar_cache(records, tablog)
+        use_cached = 1 if scalar_cache is not None else 0
+        if scalar_cache is not None:
+            wlvac_arr = scalar_cache.wlvac_arr
+            wlvac4_arr = scalar_cache.wlvac4_arr
+            cgf_arr = scalar_cache.cgf_arr
+            elo_log_arr = scalar_cache.elo_log_arr
+            gammar_arr = scalar_cache.gammar_arr
+            gammas_arr = scalar_cache.gammas_arr
+            gammaw_arr = scalar_cache.gammaw_arr
+            line_valid = scalar_cache.line_valid
+        else:
+            wlvac_arr = _dummy_f64()
+            wlvac4_arr = _dummy_f32()
+            cgf_arr = _dummy_f32()
+            elo_log_arr = _dummy_f32()
+            gammar_arr = _dummy_f32()
+            gammas_arr = _dummy_f32()
+            gammaw_arr = _dummy_f32()
+            line_valid = _dummy_u8()
+
+        use_chunks = (
+            not force_serial_linop1
+            and n_records >= _LINOP1_CHUNK_MIN_RECORDS
+        )
+        if use_chunks:
+            n_threads = max(
+                1,
+                int(os.environ.get("NUMBA_NUM_THREADS", multiprocessing.cpu_count() or 4)),
+            )
+            n_chunks = min(
+                n_threads,
+                max(1, (n_records + _LINOP1_CHUNK_TARGET - 1) // _LINOP1_CHUNK_TARGET),
+            )
+            chunk_size = (n_records + n_chunks - 1) // n_chunks
+            chunk_starts = np.arange(0, n_records, chunk_size, dtype=np.int64)
+            n_chunks = int(chunk_starts.shape[0])
+            chunk_ends = np.empty(n_chunks, dtype=np.int64)
+            for c in range(n_chunks):
+                chunk_ends[c] = (
+                    chunk_starts[c + 1] if c + 1 < n_chunks else n_records
+                )
+            nu0_st, nucont0_st, iwlold_st = _linop1_scan_boundaries_nb(
+                n_records,
+                iwl_arr,
+                iwavetab,
+                waveset,
+                int(nulo),
+                start,
+                stop,
+                ratiolg,
+                chunk_starts,
+                use_cached,
+                wlvac_arr,
+            )
+
+            if chunk_bufs is not None and len(chunk_bufs) >= n_chunks:
+                local_chunk_bufs = chunk_bufs
+            else:
+                local_chunk_bufs = [
+                    np.zeros((nrhox, numnu), dtype=np.float32) for _ in range(n_chunks)
+                ]
+
+            def _run_chunk(c: int):
+                return _linop1_kernel_nb_chunk(
+                    int(chunk_starts[c]),
+                    int(chunk_ends[c]),
+                    int(nu0_st[c]),
+                    int(nucont0_st[c]),
+                    int(iwlold_st[c]),
+                    n_records,
+                    iwl_arr,
+                    ielion_arr,
+                    ielo_arr,
+                    igflog_arr,
+                    igr_arr,
+                    igs_arr,
+                    igw_arr,
+                    waveset,
+                    iwavetab,
+                    tab,
+                    hckt_arr,
+                    xne_arr,
+                    xnfdop_arr,
+                    dopple_arr,
+                    txnxn,
+                    extab,
+                    extabf,
+                    tablog,
+                    h0tab,
+                    h1tab,
+                    h2tab,
+                    nrhox,
+                    numnu,
+                    nuhi_eff,
+                    int(nulo),
+                    start,
+                    stop,
+                    ratiolg,
+                    cgf_scale,
+                    gamma_scale,
+                    tab_col_min,
+                    max_xnfdop_arr,
+                    prefilter_flag,
+                    use_cached,
+                    wlvac_arr,
+                    wlvac4_arr,
+                    cgf_arr,
+                    elo_log_arr,
+                    gammar_arr,
+                    gammas_arr,
+                    gammaw_arr,
+                    line_valid,
+                    min_hckt,
+                    use_tight_prefilter,
+                    local_chunk_bufs[c],
+                    1,
+                )
+
+            with ThreadPoolExecutor(max_workers=n_chunks) as pool:
+                chunk_results = list(pool.map(_run_chunk, range(n_chunks)))
+            if xlines_buf is not None and xlines_buf.shape == (nrhox, numnu):
+                xlines = xlines_buf
+                xlines.fill(np.float32(0.0))
+            else:
+                xlines = np.zeros((nrhox, numnu), dtype=np.float32)
+            lineused = 0
+            for xl, lu in chunk_results:
+                xlines += xl
+                lineused += int(lu)
+        else:
+            if xlines_buf is not None and xlines_buf.shape == (nrhox, numnu):
+                xlines_out = xlines_buf
+                reuse_buffer = 1
+            else:
+                xlines_out = np.zeros((nrhox, numnu), dtype=np.float32)
+                reuse_buffer = 0
+            xlines, lineused = _linop1_kernel_nb(
+                n_records,
+                iwl_arr,
+                ielion_arr,
+                ielo_arr,
+                igflog_arr,
+                igr_arr,
+                igs_arr,
+                igw_arr,
+                waveset, iwavetab, tab,
+                hckt_arr, xne_arr, xnfdop_arr, dopple_arr, txnxn,
+                extab, extabf, tablog,
+                h0tab, h1tab, h2tab,
+                nrhox, numnu, nuhi_eff, nulo,
+                start, stop,
+                ratiolg, cgf_scale, gamma_scale,
+                tab_col_min,
+                max_xnfdop_arr,
+                prefilter_flag,
+                use_cached,
+                wlvac_arr,
+                wlvac4_arr,
+                cgf_arr,
+                elo_log_arr,
+                gammar_arr,
+                gammas_arr,
+                gammaw_arr,
+                line_valid,
+                min_hckt,
+                use_tight_prefilter,
+                xlines_out,
+                reuse_buffer,
+            )
+
         return LineOpacityState(xlines=xlines, lineused=int(lineused))
 
     # --- pure-Python fallback (slow, only used when numba is absent) ---

@@ -114,6 +114,100 @@ _NELION_TO_MASS: Dict[int, float] = {
 # Derived directly from Fortran xnfpelsyn.for IDMOL DATA statement (lines 111-126).
 # NELION = NELEM*6 for molecular ION=6; IDMOL(NELEM-39) = molecule code.
 # Integer codes match code_mol from readmol_exact; .01 suffixes are isotopologues.
+# xnfpelsyn.for DATA IDMOL (lines 111-126); index jmol -> Fortran NELEM = jmol + 40.
+XNFPELSYN_IDMOL: Tuple[float, ...] = (
+    101.0,
+    106.0,
+    107.0,
+    108.0,
+    606.0,
+    607.0,
+    608.0,
+    707.0,
+    708.0,
+    808.0,
+    112.0,
+    113.0,
+    114.0,
+    812.0,
+    813.0,
+    814.0,
+    116.0,
+    120.0,
+    816.0,
+    820.0,
+    821.0,
+    822.0,
+    823.0,
+    103.0,
+    104.0,
+    105.0,
+    109.0,
+    115.0,
+    117.0,
+    121.0,
+    122.0,
+    123.0,
+    124.0,
+    125.0,
+    126.0,
+    106.01,
+    107.01,
+    108.01,
+    112.01,
+    113.01,
+    114.01,
+    120.01,
+    111.0,
+    119.0,
+    10101.01,
+    817.0,
+    824.0,
+    825.0,
+    826.0,
+    10108.0,
+    60808.0,
+    10106.0,
+    60606.0,
+    127.0,
+    128.0,
+    129.0,
+    827.0,
+    828.0,
+    829.0,
+    608.01,
+    408.0,
+    508.0,
+    815.0,
+    10808.0,
+    10811.0,
+    10812.0,
+    10820.0,
+    10106.0,
+    10107.0,
+    10116.0,
+    10606.0,
+    10607.0,
+    10608.0,
+    10708.0,
+    70808.0,
+    80814.0,
+    80816.0,
+    1010106.0,
+    1010107.0,
+    1010606.0,
+    101010106.0,
+    101010114.0,
+    614.0,
+    60614.0,
+    60607.0,
+    6060707.0,
+    6060607.0,
+    839.0,
+    840.0,
+    857.0,
+)
+
 _NELION_TO_CODES: Dict[int, List[int]] = {
     240: [101],       # H2          IDMOL(1)=101
     246: [106],       # CH          IDMOL(2)=106
@@ -505,6 +599,55 @@ def compute_mol_xnfdop(
     return result
 
 
+def _molecular_dopple_for_nelion(
+    atm,
+    nelion: int,
+) -> np.ndarray:
+    """Fortran xnfpelsyn.for DOPPLE(6, NELEM) for one molecular species."""
+    n_layers = atm.layers
+    temperature = np.asarray(atm.temperature, dtype=np.float64)
+    mol_mass = _NELION_TO_MASS.get(nelion, 28.0)
+    thermal_vel = np.sqrt(2.0 * _KBOLTZ * temperature / (mol_mass * _AMU)) / _C_LIGHT_CMS
+    vturb = np.zeros(n_layers, dtype=np.float64)
+    if atm.turbulent_velocity is not None:
+        vturb = np.asarray(atm.turbulent_velocity, dtype=np.float64) / _C_LIGHT_CMS
+    return np.sqrt(thermal_vel**2 + vturb**2)
+
+
+def try_mol_xnfpmol_dopple_from_atm(
+    atm,
+    nelion_set: Set[int],
+) -> Optional[Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray]]]:
+    """Return molecular XNFPMOL/DOPPLE from NPZ population_per_ion when available.
+
+    convert_atm_to_npz stores XNFPMOL in population_per_ion[:, 5, nelem-1] via
+    POPS(IDMOL, 1, ...).  DOPPLE is recomputed from MOMASS and VTURB so it
+    matches the SYNTHE nmolec path.
+    """
+    if atm.population_per_ion is None:
+        return None
+
+    pop = np.asarray(atm.population_per_ion, dtype=np.float64)
+    if pop.ndim != 3 or pop.shape[1] < 6:
+        return None
+
+    xnfpmol_dict: Dict[int, np.ndarray] = {}
+    dopple_dict: Dict[int, np.ndarray] = {}
+    for nelion in nelion_set:
+        nelem = nelion // 6
+        elem_idx = nelem - 1
+        if elem_idx < 0 or elem_idx >= pop.shape[2]:
+            continue
+        xnfpmol = pop[:, 5, elem_idx]
+        if np.any(xnfpmol > 0.0):
+            xnfpmol_dict[nelion] = xnfpmol
+            dopple_dict[nelion] = _molecular_dopple_for_nelion(atm, nelion)
+
+    if len(xnfpmol_dict) != len(nelion_set):
+        return None
+    return xnfpmol_dict, dopple_dict
+
+
 def compute_mol_xnfpmol_dopple(
     atm,
     nelion_set: Set[int],
@@ -520,6 +663,13 @@ def compute_mol_xnfpmol_dopple(
     -------
     (xnfpmol_dict, dopple_dict): both keyed by NELION, values shape (n_layers,)
     """
+    cached = try_mol_xnfpmol_dopple_from_atm(atm, nelion_set)
+    if cached is not None:
+        logger.info(
+            "Using molecular populations from NPZ (%d NELION)", len(cached[0])
+        )
+        return cached
+
     xnfdop_result = compute_mol_xnfdop(atm, nelion_set, molecules_path)
     if not xnfdop_result:
         return {}, {}
@@ -541,8 +691,7 @@ def compute_mol_xnfpmol_dopple(
 
         # Reconstruct XNFPMOL and DOPPLE from XNFDOP = XNFPMOL / (RHO * DOPPLE)
         mol_mass = _NELION_TO_MASS.get(nelion, 28.0)
-        thermal_vel = np.sqrt(2.0 * _KBOLTZ * temperature / (mol_mass * _AMU)) / _C_LIGHT_CMS
-        dopple = np.sqrt(thermal_vel**2 + vturb**2)
+        dopple = _molecular_dopple_for_nelion(atm, nelion)
 
         xnfpmol = xnfdop_result[nelion] * mass_density * dopple
 

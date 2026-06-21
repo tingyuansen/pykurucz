@@ -53,7 +53,7 @@ class AtmosphereEmulator:
         if self.default_tau_grid is None:
             self.default_tau_grid = torch.logspace(-6, 2, 80)  # 80 points from 1e-6 to 100
         
-    def predict(self, teff, logg, feh, afe, tau_grid=None) -> dict:
+    def predict(self, teff, logg, feh, afe, tau_grid=None):
         """
         Predict atmospheric structure for given stellar parameters.
         
@@ -124,7 +124,7 @@ class AtmosphereEmulator:
         
         return output
     
-    def predict_atmosphere_data(self, teff, logg, feh, afe, vturb=2.0, tau_grid=None) -> np.ndarray:
+    def predict_atmosphere_data(self, teff, logg, feh, afe, vturb=2.0, tau_grid=None):
         """
         Predict the 80x9 atmosphere data array for use in .atm files.
         
@@ -141,7 +141,7 @@ class AtmosphereEmulator:
         
         Returns:
             numpy.ndarray: 80x9 atmosphere data array with columns:
-                          RHOX, T, P, XNE, ABROSS, ACCRAD, VTURB, 0, 0
+                          RHOX, T, P, XNE, ABROSS, ACCRAD, VTURB, FLXCNV, VCONV
         """
         # Get predictions from model using provided TAU grid
         pred = self.predict(teff, logg, feh, afe, tau_grid=tau_grid)
@@ -155,13 +155,13 @@ class AtmosphereEmulator:
         data[:, 4] = pred['ABROSS']     # Column 5: Rosseland mean opacity
         data[:, 5] = pred['ACCRAD']     # Column 6: Radiative acceleration
         data[:, 6] = vturb * 1e5        # Column 7: Vturb (km/s -> cm/s)
-        data[:, 7] = 0.0                # Column 8: Convective velocity (set to 0)
-        data[:, 8] = 0.0                # Column 9: Convective flux ratio (set to 0)
+        data[:, 7] = 0.0                # Column 8: Convective flux (set to 0)
+        data[:, 8] = 0.0                # Column 9: Convective velocity (set to 0)
         
         return data
 
 
-def load_emulator(weights_path=None, norm_params_path=None, device='cpu') -> "AtmosphereEmulator":
+def load_emulator(weights_path=None, norm_params_path=None, device='cpu'):
     """
     Load the pre-trained atmosphere emulator.
     

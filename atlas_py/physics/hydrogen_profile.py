@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -23,6 +22,11 @@ _C_LIGHT_CM = 2.99792458e10
 _RYDH = 3.2880515e15
 _SQRT_PI_SCALE = 1.77245
 _PI = 3.14159
+
+
+def _default_hydrogen_profile_npz_path() -> Path:
+    # atlas_py/physics -> atlas_py/data
+    return Path(__file__).resolve().parents[1] / "data" / "hydrogen_profile_atlas12.npz"
 
 
 def _default_atlas12_path() -> Path:
@@ -172,9 +176,29 @@ class HydrogenProfileTables:
     pf_h2: np.ndarray  # (200,)
 
 
-def _default_hydrogen_profile_npz_path() -> Path:
-    # atlas_py/physics -> atlas_py
-    return Path(__file__).resolve().parents[1] / "data" / "hydrogen_profile_atlas12.npz"
+def _load_hydrogen_profile_npz(npz_path: Path) -> HydrogenProfileTables:
+    with np.load(npz_path, allow_pickle=False) as data:
+        return HydrogenProfileTables(
+            propbm=np.asarray(data["propbm"], dtype=np.float64),
+            c=np.asarray(data["c"], dtype=np.float64),
+            d=np.asarray(data["d"], dtype=np.float64),
+            pp=np.asarray(data["pp"], dtype=np.float64),
+            beta=np.asarray(data["beta"], dtype=np.float64),
+            stalph=np.asarray(data["stalph"], dtype=np.float64),
+            stwtal=np.asarray(data["stwtal"], dtype=np.float64),
+            istal=np.asarray(data["istal"], dtype=np.int64),
+            lnghal=np.asarray(data["lnghal"], dtype=np.int64),
+            stcomp=np.asarray(data["stcomp"], dtype=np.float64),
+            stcpwt=np.asarray(data["stcpwt"], dtype=np.float64),
+            lncomp=np.asarray(data["lncomp"], dtype=np.int64),
+            cutoff_h2_plus=np.asarray(data["cutoff_h2_plus"], dtype=np.float64),
+            cutoff_h2=np.asarray(data["cutoff_h2"], dtype=np.float64),
+            asumlyman=np.asarray(data["asumlyman"], dtype=np.float64),
+            asum=np.asarray(data["asum"], dtype=np.float64),
+            y1wtm=np.asarray(data["y1wtm"], dtype=np.float64),
+            xknmtb=np.asarray(data["xknmtb"], dtype=np.float64),
+            pf_h2=np.asarray(data["pf_h2"], dtype=np.float64),
+        )
 
 
 @lru_cache(maxsize=2)
@@ -182,18 +206,11 @@ def load_hydrogen_profile_tables_from_atlas12(atlas12_path: str | None = None) -
     if atlas12_path is None:
         npz_path = _default_hydrogen_profile_npz_path()
         if npz_path.exists():
-            with np.load(npz_path) as data:
-                return HydrogenProfileTables(
-                    **{
-                        f.name: np.asarray(data[f.name])
-                        for f in dataclasses.fields(HydrogenProfileTables)
-                    }
-                )
+            return _load_hydrogen_profile_npz(npz_path)
+
     src = Path(atlas12_path) if atlas12_path is not None else _default_atlas12_path()
     if not src.exists():
-        raise FileNotFoundError(
-            f"hydrogen profile cache not found and atlas12.for missing: {src}"
-        )
+        raise FileNotFoundError(f"atlas12.for not found: {src}")
     lines = src.read_text(encoding="utf-8", errors="replace").splitlines()
     sofbet_names = {
         "PROB1",
@@ -1342,11 +1359,9 @@ class HydrogenProfileEvaluator:
 def equil_h2(temperature_k: np.ndarray | float, *, tables: HydrogenProfileTables | None = None) -> np.ndarray:
     tbl = load_hydrogen_profile_tables_from_atlas12() if tables is None else tables
     t = np.asarray(temperature_k, dtype=np.float64)
-    # Defensive guard (Fix 8a, 2026-05-03): NaN/inf in t silently casts to
-    # garbage int64 values which then propagate downstream and trigger
-    # ValueError in scalar callers (nmolec._interp_h2_pf). Replace
-    # non-finite or out-of-table temperatures with safe in-range floors
-    # before the floor->int cast.
+    # Fix 8a (#1 robustness): NaN/inf in t casts to garbage int64 and triggers
+    # ValueError in scalar callers (nmolec._interp_h2_pf). Replace non-finite or
+    # out-of-table temperatures with safe in-range floors before the int cast.
     t = np.where(np.isfinite(t) & (t > 100.0), t, 100.0)
     t = np.minimum(t, 19900.0)
     n = np.floor(t / 100.0).astype(np.int64)

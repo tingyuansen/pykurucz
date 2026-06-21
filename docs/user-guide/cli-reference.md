@@ -50,6 +50,8 @@ offset taken absolutely against solar** (not added on top of `--mh`/`--am`).
 | `--atlas-convergence-epsilon` | 1e-3 | Early-stop threshold on column changes |
 | `--atlas-convergence-min-iterations` | 5 | Minimum iterations before early stop |
 | `--atlas-convergence-consecutive` | 1 | Consecutive converged iterations required |
+| `--atlas-checkconv-dlntmax` | 5e-4 | Deep-layer temperature stop threshold (Fortran `checkconv.f90`: `max\|ΔT/T\|` over layers 40..jmax−5). Validated production default; pass `1e-4` for strict Fortran parity |
+| `--fortran-convergence` | — | Restore the Fortran-faithful `checkconv` threshold `dlntmax=1e-4` (equivalent to `--atlas-checkconv-dlntmax 1e-4`) |
 | `--no-atlas-convergence` | — | Disable early stopping; force all iterations |
 
 ### Molecular lines

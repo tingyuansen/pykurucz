@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import List, Optional
 
 from . import config
-from .engine.opacity import run_synthesis
 from .io import persist
 from .utils.logging import configure_logging
 
@@ -186,6 +185,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    # Apply thread budget before any numba JIT imports in synthe_py.engine.opacity.
+    from atlas_py.engine.threading_policy import ThreadingPolicy, log_threading_banner
+
+    synthe_policy = ThreadingPolicy.for_synthe_grid(
+        args.n_workers,
+        wl_start=args.wl_start,
+        wl_end=args.wl_end,
+        resolution=args.resolution,
+    )
+    synthe_policy.apply()
+    log_threading_banner(synthe_policy, stage="synthe_py")
+
+    from .engine.opacity import run_synthesis
+
     diagnostics_path = args.diagnostics
 
     resolved_molecular_dirs: List[Path]
@@ -239,7 +252,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     configure_logging(cfg.log_level)
     persist.ensure_cache_dirs(cfg)
-    run_synthesis(cfg)
+    run_synthesis(cfg, synthe_policy=synthe_policy)
     return 0
 
 

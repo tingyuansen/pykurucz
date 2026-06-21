@@ -19,7 +19,11 @@ merge_molecular_into_compiled(compiled, *mol_dicts)        -> CompiledLineCatalo
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 import math
+import os
 import struct
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -28,6 +32,83 @@ import numpy as np
 
 from .compiler import CompiledLineCatalog
 from .fort19 import Fort19Data
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Molecular line cache (NPZ)
+# ---------------------------------------------------------------------------
+_MOL_CACHE_SCHEMA = 2  # bump when the compiled output format changes
+
+
+def _mol_cache_key(
+    source_paths: Sequence[Path],
+    wlbeg: float,
+    wlend: float,
+    resolution: float,
+    ifvac: int,
+    extra: str = "",
+) -> str:
+    """Deterministic hex digest for molecular compilation inputs."""
+    payload: dict = {
+        "schema": _MOL_CACHE_SCHEMA,
+        "wlbeg": float(wlbeg),
+        "wlend": float(wlend),
+        "resolution": float(resolution),
+        "ifvac": int(ifvac),
+        "extra": extra,
+    }
+    # Include file paths + sizes + mtimes for invalidation
+    file_info = []
+    for p in sorted(source_paths):
+        try:
+            st = p.stat()
+            file_info.append((str(p.resolve()), int(st.st_size),
+                              int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))))
+        except OSError:
+            file_info.append((str(p), 0, 0))
+    payload["files"] = file_info
+    raw = json.dumps(payload, sort_keys=True).encode()
+    return hashlib.blake2b(raw, digest_size=12).hexdigest()
+
+
+def _mol_cache_dir(source_paths: Sequence[Path]) -> Path:
+    """Return cache directory near the first source file."""
+    if source_paths:
+        base = source_paths[0].parent
+    else:
+        base = Path.cwd()
+    return base / ".py_mol_cache"
+
+
+def _save_mol_cache(cache_path: Path, data: Dict[str, np.ndarray]) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(cache_path, **data)
+    logger.info("Saved molecular cache: %s (%d lines)", cache_path, len(data.get("nbuff", [])))
+
+
+def _load_mol_cache(cache_path: Path) -> Optional[Dict[str, np.ndarray]]:
+    if not cache_path.exists():
+        return None
+    if os.environ.get("PY_DISABLE_MOL_CACHE", "0") == "1":
+        return None
+    try:
+        data = np.load(cache_path)
+        result = {
+            "nbuff": np.asarray(data["nbuff"], dtype=np.int32),
+            "cgf": np.asarray(data["cgf"], dtype=np.float32),
+            "nelion": np.asarray(data["nelion"], dtype=np.int16),
+            "elo_cm": np.asarray(data["elo_cm"], dtype=np.float32),
+            "gamma_rad": np.asarray(data["gamma_rad"], dtype=np.float32),
+            "gamma_stark": np.asarray(data["gamma_stark"], dtype=np.float32),
+            "gamma_vdw": np.asarray(data["gamma_vdw"], dtype=np.float32),
+            "limb": np.asarray(data["limb"], dtype=np.int16),
+        }
+        logger.info("Loaded molecular cache: %s (%d lines)", cache_path, len(result["nbuff"]))
+        return result
+    except Exception as exc:
+        logger.warning("Failed to load molecular cache %s: %s", cache_path, exc)
+        return None
 
 # ---------------------------------------------------------------------------
 # Physical constants (match Fortran values exactly)
@@ -320,6 +401,14 @@ def compile_molecular_ascii(
       nbuff, cgf, nelion, elo_cm, gamma_rad, gamma_stark, gamma_vdw, limb
     (all 1-D numpy arrays, same semantics as CompiledLineCatalog fields)
     """
+    # --- Check disk cache ---
+    cache_key = _mol_cache_key(list(paths), wlbeg, wlend, resolution, ifvac, extra=f"ascii_ifpred{ifpred}")
+    cache_dir = _mol_cache_dir(list(paths))
+    cache_path = cache_dir / f"mol_ascii_{cache_key}.npz"
+    cached = _load_mol_cache(cache_path)
+    if cached is not None:
+        return cached
+
     ratio = 1.0 + 1.0 / resolution
     ratiolg = math.log(ratio)
     ixwlbeg = math.floor(math.log(wlbeg) / ratiolg)
@@ -414,7 +503,9 @@ def compile_molecular_ascii(
                 gamma_vdws.append(gamwf)
                 limbs.append(7)  # molecular lines: LIM=7 (large line_size -> min(8-0,7)=7)
 
-    return _arrays(nbuffs, cgfs, nelions, elos, gamma_rads, gamma_starks, gamma_vdws, limbs)
+    result = _arrays(nbuffs, cgfs, nelions, elos, gamma_rads, gamma_starks, gamma_vdws, limbs)
+    _save_mol_cache(cache_path, result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +562,14 @@ def compile_tio_schwenke(
     Fortran COMMON /IIIIIII/IWL,IELION,IELO,IGFLOG,IGR,IGS,IGW with INTEGER*4 IIIIIII(4)
     maps to exactly 16 bytes = one direct-access record (RECORDSIZE=4 in 4-byte units).
     """
+    # --- Check disk cache ---
+    cache_key = _mol_cache_key([bin_path], wlbeg, wlend, resolution, ifvac, extra="tio_schwenke")
+    cache_dir = _mol_cache_dir([bin_path])
+    cache_path = cache_dir / f"mol_tio_{cache_key}.npz"
+    cached = _load_mol_cache(cache_path)
+    if cached is not None:
+        return cached
+
     tablog = _get_tablog()
     ratio = 1.0 + 1.0 / resolution
     ratiolg = math.log(ratio)
@@ -547,7 +646,9 @@ def compile_tio_schwenke(
     nelion = np.full(n_sel, _TIO_NELION, dtype=np.int32)
     limb   = np.full(n_sel, 7, dtype=np.int16)
 
-    return _arrays(nbuff, cgf, nelion, elo, gamrf, gamsf, gamwf, limb)
+    result = _arrays(nbuff, cgf, nelion, elo, gamrf, gamsf, gamwf, limb)
+    _save_mol_cache(cache_path, result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -585,6 +686,14 @@ def compile_h2o_partridge(
       FREQ is computed BEFORE the air correction is applied to WLVAC (line 136).
       WLVAC used in NBUFF and GAMMAR is the post-air wavelength (lines 142, 165).
     """
+    # --- Check disk cache ---
+    cache_key = _mol_cache_key([bin_path], wlbeg, wlend, resolution, ifvac, extra="h2o_partridge")
+    cache_dir = _mol_cache_dir([bin_path])
+    cache_path = cache_dir / f"mol_h2o_{cache_key}.npz"
+    cached = _load_mol_cache(cache_path)
+    if cached is not None:
+        return cached
+
     tablog = _get_tablog()
     ratio = 1.0 + 1.0 / resolution
     ratiolg = math.log(ratio)
@@ -658,7 +767,9 @@ def compile_h2o_partridge(
     nelion = np.full(n_sel, _H2O_NELION, dtype=np.int32)
     limb   = np.full(n_sel, 7, dtype=np.int16)
 
-    return _arrays(nbuff, cgf, nelion, elo, gamrf, gamsf, gamwf, limb)
+    result = _arrays(nbuff, cgf, nelion, elo, gamrf, gamsf, gamwf, limb)
+    _save_mol_cache(cache_path, result)
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -113,6 +113,7 @@ nav:
       - Atmosphere Emulator: architecture/emulator.md
       - Data Flows: architecture/data-flows.md
       - Fortran Parity: architecture/fortran-parity.md
+      - Accuracy Deviations: physical_accuracy_deviations.md
   - Physics:
       - Radiative Transfer: physics/radiative-transfer.md
       - Opacity: physics/opacity.md

@@ -1780,34 +1780,31 @@ if __name__ == "__main__":
         xnfh_mode12 = np.maximum(xnfh[:, 0], 1e-40)  # mode=12 (NOT /U) for HRAYOP
 
         # Compute H2 the same way xnfpelsyn does: XNFH2 = XNFH**2 * EQ.
-        xnf_h2 = np.zeros(n_layers, dtype=np.float64)
-        for j in range(n_layers):
-            T = derived["temperature"][j]
-            if T > 9000.0:
-                xnf_h2[j] = 0.0
-                continue
-            TKEV = derived["tkev"][j]
-            TLOG = derived["tlog"][j]
-            eq = np.exp(
-                4.478 / TKEV
-                - 4.64584e1
+        T_arr = derived["temperature"]
+        TKEV_arr = derived["tkev"]
+        TLOG_arr = derived["tlog"]
+        hot_mask = T_arr > 9000.0
+        eq = np.exp(
+            4.478 / TKEV_arr
+            - 4.64584e1
+            + (
+                1.63660e-3
                 + (
-                    1.63660e-3
+                    -4.93992e-7
                     + (
-                        -4.93992e-7
-                        + (
-                            1.11822e-10
-                            + (-1.49567e-14 + (1.06206e-18 - 3.08720e-23 * T) * T)
-                            * T
-                        )
-                        * T
+                        1.11822e-10
+                        + (-1.49567e-14 + (1.06206e-18 - 3.08720e-23 * T_arr) * T_arr)
+                        * T_arr
                     )
-                    * T
+                    * T_arr
                 )
-                * T
-                - 1.5 * TLOG
+                * T_arr
             )
-            xnf_h2[j] = xnfh_mode12[j] ** 2 * eq
+            * T_arr
+            - 1.5 * TLOG_arr
+        )
+        xnf_h2 = xnfh_mode12 ** 2 * eq
+        xnf_h2[hot_mask] = 0.0
 
         # From xnfpelsyn.for:
         #   Line 253: CALL POPS(2.01D0,12,XNFHE) - for XNFHE (not used by KAPP)
@@ -2349,6 +2346,40 @@ if __name__ == "__main__":
                 raise RuntimeError(
                     f"Failed to compute populations for element {elem_num}"
                 ) from e
+
+        # Molecular XNFPMOL (xnfpelsyn.for line 328: POPS(IDMOL,1,XNFP(1,6,NELEM)))
+        from synthe_py.physics.mol_populations import XNFPELSYN_IDMOL
+
+        for jmol, idmol_code in enumerate(XNFPELSYN_IDMOL):
+            if idmol_code <= 0.0:
+                break
+            nelem = jmol + 40
+            if nelem > 99:
+                break
+            mol_number = np.zeros((n_layers, 10), dtype=np.float64)
+            try:
+                pops_exact(
+                    float(idmol_code),
+                    11,
+                    mol_number,
+                    derived["temperature"],
+                    derived["tkev"],
+                    derived["tk"],
+                    derived["hkt"],
+                    derived["hckt"],
+                    derived["tlog"],
+                    derived["gas_pressure"],
+                    xne_for_pops,
+                    xnatm_for_pops,
+                    xabund,
+                    departure_tables=departure_tables,
+                )
+                population[:, 5, nelem - 1] = mol_number[:, 0]
+            except Exception as e:
+                print(
+                    f"  WARNING: molecular POPS failed for NELEM={nelem} "
+                    f"IDMOL={idmol_code}: {e}"
+                )
 
         t_pops = time.time() - t0
         print(f"  Computed populations: shape {population.shape}")

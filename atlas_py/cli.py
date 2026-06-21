@@ -79,9 +79,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help=(
-            "Optional early-stop threshold on max normalized change across "
-            "physical atmosphere columns (RHOX,T,P,XNE,ABROSS,VTURB). "
-            "Disabled by default."
+            "Early-stop enable switch. When set, ATLAS stops once the Fortran "
+            "checkconv.f90 criterion is met (max |dT/T| over deep layers 40-75 "
+            "< dlntmax). The threshold itself is set by --checkconv-dlntmax "
+            "(default 5e-4). Disabled by default."
         ),
     )
     parser.add_argument(
@@ -96,6 +97,56 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Consecutive converged iterations required before early stopping (default: 1)",
     )
+    parser.add_argument(
+        "--checkconv-dlntmax",
+        type=float,
+        default=5.0e-4,
+        help=(
+            "Deep-layer temperature stop threshold for the Fortran checkconv.f90 "
+            "criterion (MAXVAL(|dT/T|, layers 40..jmax-5) < dlntmax). Validated "
+            "production default 5e-4 (~53%% fewer iterations than Fortran's 1e-4 "
+            "with worst-case spectrum error max|F/C|=0.0062; see "
+            "results/convergence_criteria/REPORT.md). Overridden by the "
+            "ATLAS_CHECKCONV_DLNTMAX env var if set."
+        ),
+    )
+    parser.add_argument(
+        "--fortran-convergence",
+        action="store_true",
+        help="Restore the Fortran-faithful checkconv dlntmax=1e-4 threshold "
+        "(equivalent to --checkconv-dlntmax 1e-4).",
+    )
+    parser.add_argument(
+        "--n-workers",
+        type=int,
+        default=None,
+        help=(
+            "Total CPU thread budget (frequency loop pool size when atlas_py "
+            "runs standalone). Default: all logical CPUs."
+        ),
+    )
+    parser.add_argument(
+        "--linop1-serial",
+        action="store_true",
+        help="Force serial LINOP1.",
+    )
+    parser.add_argument(
+        "--convec-fd-parallel",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable parallel CONVEC FD (default: on when n-workers>1).",
+    )
+    parser.add_argument(
+        "--pops-parallel",
+        action="store_true",
+        help="Enable parallel POPS/NELECT (default: off).",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="Directory for fort.12 SELECTLINES disk cache (speeds repeated runs).",
+    )
     return parser
 
 
@@ -105,6 +156,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     args = build_parser().parse_args(argv)
+    checkconv_dlntmax = 1.0e-4 if args.fortran_convergence else args.checkconv_dlntmax
     cfg = AtlasConfig(
         inputs=AtlasInput(
             atmosphere_path=args.atm,
@@ -129,6 +181,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         convergence_epsilon=args.convergence_epsilon,
         convergence_min_iterations=args.convergence_min_iterations,
         convergence_consecutive=args.convergence_consecutive,
+        convergence_dlntmax=checkconv_dlntmax,
+        n_workers=args.n_workers,
+        cache_dir=args.cache_dir,
+        linop1_serial=True if args.linop1_serial else None,
+        convec_fd_parallel=args.convec_fd_parallel,
+        pops_parallel=True if args.pops_parallel else None,
     )
     # Fix 10: catch ZeroDivisionError / FloatingPointError that escape josh
     # Python fallback so the slurm task exits cleanly rather than killing the whole array.

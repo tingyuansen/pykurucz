@@ -17,6 +17,11 @@ _ISO_COLS = 265
 _ISO_ROWS = 20
 
 
+def _default_isotopes_npz_path() -> Path:
+    # atlas_py/physics -> atlas_py/data
+    return Path(__file__).resolve().parents[1] / "data" / "isotopes_atlas12.npz"
+
+
 def _default_atlas12_path() -> Path:
     # Used only when re-extracting tables from Fortran source; the normal
     # runtime path is the pre-extracted .npz cache below.
@@ -310,9 +315,15 @@ def _major_isotope_mass(isotope: np.ndarray) -> np.ndarray:
     return amass
 
 
-def _default_isotopes_npz_path() -> Path:
-    # atlas_py/physics -> atlas_py
-    return Path(__file__).resolve().parents[1] / "data" / "isotopes_atlas12.npz"
+def _load_isotopes_npz(npz_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    with np.load(npz_path, allow_pickle=False) as data:
+        isotope = np.asarray(data["isotope"], dtype=np.float64)
+        amassiso_major = np.asarray(data["amassiso_major"], dtype=np.float64)
+    if isotope.shape != (10, 2, _MION):
+        raise RuntimeError(f"Invalid isotope shape in {npz_path}: {isotope.shape}")
+    if amassiso_major.shape != (_MION,):
+        raise RuntimeError(f"Invalid amassiso_major shape in {npz_path}: {amassiso_major.shape}")
+    return isotope, amassiso_major
 
 
 @lru_cache(maxsize=2)
@@ -323,26 +334,18 @@ def load_isotopes_from_atlas12(atlas12_path: str | None = None) -> tuple[np.ndar
     - isotope: shape (10, 2, 1006)
     - amassiso_major: shape (1006,), max-abundance isotope mass per NELION
 
-    Loads from the pre-extracted ``atlas_py/data/isotopes_atlas12.npz`` when
-    present (the normal runtime path).  Falls back to parsing the Fortran
-    source ``atlas12.for`` only when the cache is absent or an explicit path
-    is given (extraction / regeneration path).
+    Imperative isotope assignments in `SUBROUTINE ISOTOPES` are applied
+    before the final `ISOTOPE` packing loops.
     """
 
     if atlas12_path is None:
         npz_path = _default_isotopes_npz_path()
         if npz_path.exists():
-            with np.load(npz_path) as data:
-                return (
-                    np.asarray(data["isotope"], dtype=np.float64),
-                    np.asarray(data["amassiso_major"], dtype=np.float64),
-                )
+            return _load_isotopes_npz(npz_path)
 
     src = Path(atlas12_path) if atlas12_path is not None else _default_atlas12_path()
     if not src.exists():
-        raise FileNotFoundError(
-            f"isotopes cache not found and atlas12.for missing: {src}"
-        )
+        raise FileNotFoundError(f"atlas12.for not found: {src}")
     lines = src.read_text(encoding="utf-8", errors="replace").splitlines()
     body = _extract_isotopes_body(lines)
     isoion = _parse_isoion_from_isotopes_body(body)

@@ -49,10 +49,6 @@ def solve_lte_frequency(
     line_scattering: np.ndarray,
     line_source: Optional[np.ndarray] = None,
 ) -> Tuple[float, float]:
-    """Solve LTE radiative transfer for a single frequency.
-
-    Returns the emergent flux and continuum flux at the given wavelength.
-    """
 
     # Filter INF/NaN values in continuum opacity (prevents TAUNU integration failure)
     # Fortran uses REAL*4 for CONTINUUM (max ~3.4e38), so filter values exceeding this
@@ -346,6 +342,52 @@ def solve_lte_spectrum(
 
     # Log initial status
     logger.info(f"Solving radiative transfer for {n_points:,} wavelengths...")
+
+    # ── Fast path: Numba prange (no Python dispatch overhead) ──────────
+    # Eliminates ~537k Python function calls by running the entire wavelength
+    # loop as a single compiled Numba call with OpenMP-style prange.
+    # Set PY_RT_NO_NUMBA=1 to force the Python fallback.
+    _use_numba = os.getenv("PY_RT_NO_NUMBA", "") == ""
+    if _use_numba:
+        try:
+            from synthe_py.engine._rt_numba import solve_all_wavelengths_prange
+
+            logger.info(
+                "Using Numba prange fast path (%d wavelengths, "
+                "NUMBA_NUM_THREADS controls parallelism)",
+                n_points,
+            )
+            import time as _time
+            _t0 = _time.perf_counter()
+            _has_ls = line_source is not None
+            # Numba needs a concrete 2-D array; pass a dummy when absent.
+            _ls_arr = line_source if _has_ls else np.empty((0, 0), dtype=np.float64)
+            flux_total, flux_cont = solve_all_wavelengths_prange(
+                wavelength_nm,
+                temperature,
+                column_mass,
+                cont_abs,
+                cont_scat,
+                line_opacity,
+                line_scattering,
+                _ls_arr,
+                _has_ls,
+            )
+            _elapsed = _time.perf_counter() - _t0
+            logger.info(
+                "Numba prange completed: %d wavelengths in %.2fs (%.1f wl/s)",
+                n_points,
+                _elapsed,
+                n_points / max(_elapsed, 1e-9),
+            )
+            return flux_total, flux_cont
+        except Exception as exc:
+            logger.warning(
+                "Numba prange failed (%s: %s); falling back to Python loop",
+                type(exc).__name__,
+                exc,
+            )
+
     if n_points > 10000:
         logger.warning(
             f"Large wavelength grid ({n_points:,} points) - "
@@ -367,11 +409,12 @@ def solve_lte_spectrum(
 
     # Process wavelengths
     if n_workers > 1 and n_points > 100:  # Only parallelize for large grids
-        # Parallel processing using ThreadPoolExecutor — avoids the overhead of
-        # pickling numpy arrays that ProcessPoolExecutor incurs.  The JOSH
-        # solver's inner Numba kernels (_josh_iteration_kernel, _map1_kernel,
-        # _integ, _parcoe, _deriv) release the GIL, enabling genuine
-        # parallelism for the compute-heavy phases.
+        # Parallel processing using ThreadPoolExecutor — avoids pickling large
+        # numpy views for ProcessPoolExecutor.  Real overlap across threads
+        # requires JOSH Numba kernels compiled with nogil=True (see
+        # synthe_py.physics.josh_solver); nopython=True alone does not request
+        # GIL release.  Time in solve_lte_frequency / solve_josh_flux outside
+        # those kernels is still serialized by the GIL.
         log_interval = max(1, n_points // 100)  # Log every 1%
         completed = 0
 
