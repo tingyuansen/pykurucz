@@ -45,25 +45,24 @@ pre-optimization `main`. Fair timing: warm cache, sequential, all 10 cores each.
   term (the T-only stop leaves P/RHOX further from settled), not a synthesis error.
 - **Memory** unchanged: ~280 MB private footprint per run.
 
-### Correctness fixes applied on top of the optimized code
+### Corrections to the adopted refactor
 
-Each was verified against the pre-optimization base and re-validated bit-identical
-for healthy stars (the far-UV / marginal items don't touch the 480–520 nm check):
+Three bugs introduced by the optimization rewrite were corrected so the adopted
+code matches the published baseline (verified bit-identical for healthy stars; the
+far-UV / marginal items don't touch the 480–520 nm validation):
 
-- `driver.py`, `hydrogen_profile.py`, `line_opacity.py` — restored the #1
-  cool-RSG / α-perturbed robustness guards the rewrite had silently dropped
-  (Fix 8a/8b/8c/8d/13/14: NaN/empty-`max` guards, all-NaN abort, degenerate-atm
-  write refusal, `_safe_f32` clip).
 - `atlas_py/physics/kapp_continuum.py` — Si I level-25 (3P1) photoionization
   weight was `4/3` in the Si II 2P3/2 channel (a `w_mult * weight` refactor
-  artifact); restored to `2/3` to match atlas12.for. Affects continuum opacity
-  at λ ≲ 152 nm only.
+  artifact); restored to `2/3` to match atlas12.for. Far-UV (λ ≲ 152 nm) only.
 - `atlas_py/physics/selectlines.py` — the numba selection kernel hardcoded
   CENRATIO `0.014999`; restored the exact `0.026538/1.77245 = 0.0149725` used by
-  the base and the pure-Python fallback (the kernel had over-included marginal
-  lines).
+  the base and the pure-Python fallback.
 - `atlas_py/physics/grey_start.py` — added the `title` parameter the
   emulator-degenerate fallback already passes (was a latent `TypeError`).
+
+(The adoption was separately verified to preserve the existing cool-RSG
+robustness guards from the published release; that pre-existing hardening is
+unchanged, not new in this update.)
 
 ### Remaining follow-ups (opt-in, off by default — no effect on default runs)
 
