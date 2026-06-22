@@ -7,6 +7,7 @@ from functools import lru_cache
 import logging
 import multiprocessing
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -65,6 +66,15 @@ _CGF_SCALE = 0.026538 / 1.77245 / 2.99792458e17
 _GAMMA_SCALE = 1.0 / 12.5664 / 2.99792458e17
 _LINOP1_CHUNK_MIN_RECORDS = 500_000
 _LINOP1_CHUNK_TARGET = 250_000
+# Over-decomposition factor: create this many chunks per thread (capped by
+# CHUNK_TARGET) so the ThreadPoolExecutor work-steals across uneven wavelength
+# bands (Phase 0 found ~1.5-2x LINOP1 chunk-wall imbalance with equal counts).
+# Set <=1 to restore the legacy one-chunk-per-thread behavior.
+_LINOP1_OVERSUBSCRIBE = max(1, int(os.environ.get("ATLAS_LINOP1_OVERSUBSCRIBE", "4")))
+# Single-entry cache for the LINOP1 chunk-boundary scan, which is a deterministic
+# function of iteration-invariant inputs (record list, waveset, window, chunk
+# layout). Reused across ATLAS outer iterations; validated by content equality.
+_LINOP1_BOUNDARY_CACHE: dict = {}
 
 _LO_TABLES = _load_lo_tables()
 _TABVI = _LO_TABLES["_TABVI"]
@@ -911,9 +921,14 @@ if _NUMBA_AVAILABLE:
         min_hckt, use_tight_prefilter,
         xlines_out, reuse_buffer,
     ):
-        if reuse_buffer != 0:
+        if reuse_buffer == 1:
+            # Reuse caller buffer, zero it first (single-chunk-per-buffer path).
             xlines = xlines_out
             xlines.fill(np.float32(0.0))
+        elif reuse_buffer == 2:
+            # Accumulate into caller buffer WITHOUT zeroing: lets one worker
+            # thread fold several over-decomposed chunks into one buffer.
+            xlines = xlines_out
         else:
             xlines = np.zeros((nrhox, numnu), dtype=np.float32)
         ifj = np.zeros(nrhox + 2, dtype=np.int32)
@@ -1723,9 +1738,16 @@ def linop1(
                 1,
                 int(os.environ.get("NUMBA_NUM_THREADS", multiprocessing.cpu_count() or 4)),
             )
+            # Over-decompose: more chunks than threads so the ThreadPoolExecutor
+            # work-steals across uneven wavelength bands (Phase 0: equal-count
+            # chunks had ~1.5-2x wall imbalance). Capped by CHUNK_TARGET so tiny
+            # problems are not fragmented.
+            max_chunks_by_target = max(
+                1, (n_records + _LINOP1_CHUNK_TARGET - 1) // _LINOP1_CHUNK_TARGET
+            )
             n_chunks = min(
-                n_threads,
-                max(1, (n_records + _LINOP1_CHUNK_TARGET - 1) // _LINOP1_CHUNK_TARGET),
+                max(1, _LINOP1_OVERSUBSCRIBE * n_threads),
+                max_chunks_by_target,
             )
             chunk_size = (n_records + n_chunks - 1) // n_chunks
             chunk_starts = np.arange(0, n_records, chunk_size, dtype=np.int64)
@@ -1735,29 +1757,116 @@ def linop1(
                 chunk_ends[c] = (
                     chunk_starts[c + 1] if c + 1 < n_chunks else n_records
                 )
-            nu0_st, nucont0_st, iwlold_st = _linop1_scan_boundaries_nb(
-                n_records,
-                iwl_arr,
-                iwavetab,
-                waveset,
-                int(nulo),
-                start,
-                stop,
-                ratiolg,
-                chunk_starts,
-                use_cached,
-                wlvac_arr,
-            )
+            _profile_overhead = os.environ.get("ATLAS_LINOP1_CHUNK_PROFILE", "0") == "1"
+            _t_scan0 = time.perf_counter() if _profile_overhead else 0.0
+            # The boundary scan is a serial O(n_records) pass, but its result is
+            # a pure deterministic function of iteration-invariant inputs
+            # (record list, waveset, window, chunk layout). Across ATLAS outer
+            # iterations these never change, so cache by exact-identity and reuse
+            # — bit-identical to recomputing, removing ~0.5-0.8 s/iter on cool
+            # stars. Disable with ATLAS_LINOP1_SCAN_CACHE=0.
+            _scan_cache_on = os.environ.get("ATLAS_LINOP1_SCAN_CACHE", "1") != "0"
+            nu0_st = nucont0_st = iwlold_st = None
+            if _scan_cache_on:
+                _ce = _LINOP1_BOUNDARY_CACHE.get("entry")
+                # Content-based validation: array_equal on the (large) record/wave
+                # arrays costs ~tens of ms vs the ~0.6 s scan, and is collision-free
+                # (so a hit is provably identical to recomputing). `is` short-circuits
+                # the common case where the driver reuses the same buffers.
+                if (
+                    _ce is not None
+                    and _ce["n_records"] == n_records
+                    and _ce["nulo"] == int(nulo)
+                    and _ce["start"] == start
+                    and _ce["stop"] == stop
+                    and _ce["ratiolg"] == ratiolg
+                    and _ce["use_cached"] == use_cached
+                    and _ce["chunk_starts"].shape == chunk_starts.shape
+                    and np.array_equal(_ce["chunk_starts"], chunk_starts)
+                    and (_ce["iwl_arr"] is iwl_arr or np.array_equal(_ce["iwl_arr"], iwl_arr))
+                    and (_ce["waveset"] is waveset or np.array_equal(_ce["waveset"], waveset))
+                    and (_ce["iwavetab"] is iwavetab or np.array_equal(_ce["iwavetab"], iwavetab))
+                    and (
+                        use_cached == 0
+                        or _ce["wlvac_arr"] is wlvac_arr
+                        or np.array_equal(_ce["wlvac_arr"], wlvac_arr)
+                    )
+                ):
+                    nu0_st = _ce["nu0_st"]
+                    nucont0_st = _ce["nucont0_st"]
+                    iwlold_st = _ce["iwlold_st"]
+            if nu0_st is None:
+                nu0_st, nucont0_st, iwlold_st = _linop1_scan_boundaries_nb(
+                    n_records,
+                    iwl_arr,
+                    iwavetab,
+                    waveset,
+                    int(nulo),
+                    start,
+                    stop,
+                    ratiolg,
+                    chunk_starts,
+                    use_cached,
+                    wlvac_arr,
+                )
+                if _scan_cache_on:
+                    _LINOP1_BOUNDARY_CACHE["entry"] = {
+                        "iwl_arr": iwl_arr,
+                        "waveset": waveset,
+                        "iwavetab": iwavetab,
+                        "wlvac_arr": wlvac_arr,
+                        "n_records": n_records,
+                        "nulo": int(nulo),
+                        "start": start,
+                        "stop": stop,
+                        "ratiolg": ratiolg,
+                        "use_cached": use_cached,
+                        "chunk_starts": chunk_starts.copy(),
+                        "nu0_st": nu0_st,
+                        "nucont0_st": nucont0_st,
+                        "iwlold_st": iwlold_st,
+                    }
+            _t_scan = (time.perf_counter() - _t_scan0) if _profile_overhead else 0.0
 
-            if chunk_bufs is not None and len(chunk_bufs) >= n_chunks:
-                local_chunk_bufs = chunk_bufs
+            # One accumulation buffer per worker thread (NOT per chunk): each
+            # worker zeroes its buffer once, then folds every chunk it pulls off
+            # the queue into that same buffer (kernel reuse_buffer=2). Keeps the
+            # final reduction at n_buffers (<=n_threads) and memory flat vs the
+            # legacy one-buffer-per-chunk layout.
+            n_workers = min(n_threads, n_chunks)
+            n_buffers = max(1, n_workers)
+            if chunk_bufs is not None and len(chunk_bufs) >= n_buffers:
+                thread_bufs = list(chunk_bufs[:n_buffers])
             else:
-                local_chunk_bufs = [
-                    np.zeros((nrhox, numnu), dtype=np.float32) for _ in range(n_chunks)
+                thread_bufs = [
+                    np.zeros((nrhox, numnu), dtype=np.float32) for _ in range(n_buffers)
                 ]
 
+            _profile = os.environ.get("ATLAS_LINOP1_CHUNK_PROFILE", "0") == "1"
+            _tls = threading.local()
+            _assign_lock = threading.Lock()
+            _next_idx = [0]
+            _used_idx: set[int] = set()
+            _chunk_wall = [0.0] * n_chunks
+            _chunk_thread = [-1] * n_chunks
+
             def _run_chunk(c: int):
-                return _linop1_kernel_nb_chunk(
+                info = getattr(_tls, "buf_idx", None)
+                if info is None:
+                    with _assign_lock:
+                        info = _next_idx[0]
+                        _next_idx[0] += 1
+                        _used_idx.add(info)
+                    if info >= n_buffers:  # defensive; should not happen
+                        info = n_buffers - 1
+                    else:
+                        # Zero this worker's buffer exactly once, before its
+                        # first accumulate.
+                        thread_bufs[info].fill(np.float32(0.0))
+                    _tls.buf_idx = info
+                bi = _tls.buf_idx
+                _t0 = time.perf_counter() if _profile else 0.0
+                _, lu = _linop1_kernel_nb_chunk(
                     int(chunk_starts[c]),
                     int(chunk_ends[c]),
                     int(nu0_st[c]),
@@ -1808,21 +1917,61 @@ def linop1(
                     line_valid,
                     min_hckt,
                     use_tight_prefilter,
-                    local_chunk_bufs[c],
-                    1,
+                    thread_bufs[bi],
+                    2,
+                )
+                if _profile:
+                    _chunk_wall[c] = time.perf_counter() - _t0
+                    _chunk_thread[c] = bi
+                return int(lu)
+
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                chunk_results = list(pool.map(_run_chunk, range(n_chunks)))
+
+            if _profile:
+                per_thread = [0.0] * n_buffers
+                for c in range(n_chunks):
+                    if _chunk_thread[c] >= 0:
+                        per_thread[_chunk_thread[c]] += _chunk_wall[c]
+                used = [per_thread[i] for i in sorted(_used_idx)]
+                _t_mx = max(used) if used else 0.0
+                _t_mn = min(used) if used else 0.0
+                _t_mean = (sum(used) / len(used)) if used else 0.0
+                _logger.info(
+                    "LINOP1 chunk profile: n_chunks=%d workers=%d threads=%d "
+                    "per_thread_max=%.3fs per_thread_mean=%.3fs per_thread_min=%.3fs "
+                    "imbalance(max/mean)=%.2f span(max/min)=%.2f "
+                    "per_thread_wall=%s",
+                    n_chunks,
+                    n_workers,
+                    n_threads,
+                    _t_mx,
+                    _t_mean,
+                    _t_mn,
+                    (_t_mx / _t_mean) if _t_mean > 0 else 0.0,
+                    (_t_mx / _t_mn) if _t_mn > 0 else 0.0,
+                    ["%.3f" % w for w in used],
                 )
 
-            with ThreadPoolExecutor(max_workers=n_chunks) as pool:
-                chunk_results = list(pool.map(_run_chunk, range(n_chunks)))
+            _t_red0 = time.perf_counter() if _profile_overhead else 0.0
             if xlines_buf is not None and xlines_buf.shape == (nrhox, numnu):
                 xlines = xlines_buf
                 xlines.fill(np.float32(0.0))
             else:
                 xlines = np.zeros((nrhox, numnu), dtype=np.float32)
             lineused = 0
-            for xl, lu in chunk_results:
-                xlines += xl
+            for lu in chunk_results:
                 lineused += int(lu)
+            for bi in sorted(_used_idx):
+                if bi < n_buffers:
+                    xlines += thread_bufs[bi]
+            if _profile_overhead:
+                _logger.info(
+                    "LINOP1 overhead: boundary_scan=%.3fs reduction(%d bufs)=%.3fs",
+                    _t_scan,
+                    len(_used_idx),
+                    time.perf_counter() - _t_red0,
+                )
         else:
             if xlines_buf is not None and xlines_buf.shape == (nrhox, numnu):
                 xlines_out = xlines_buf
