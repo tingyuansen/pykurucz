@@ -3253,7 +3253,10 @@ def run_synthesis(cfg: SynthesisConfig, *, synthe_policy=None) -> SynthResult:
                     combined_mol[key] = np.concatenate([d[key] for d in mol_dicts])
 
             n_mol_lines = len(combined_mol["nbuff"])
-            unique_nelions = set(int(n) for n in combined_mol["nelion"])
+            # Vectorized unique (was a 47.8M-element Python genexpr ~3.4s/run).
+            unique_nelions = set(
+                np.unique(np.asarray(combined_mol["nelion"], dtype=np.int64)).tolist()
+            )
             logger.info(
                 "Molecular unified path: %d lines, %d NELION species",
                 n_mol_lines, len(unique_nelions),
@@ -3324,9 +3327,12 @@ def run_synthesis(cfg: SynthesisConfig, *, synthe_policy=None) -> SynthResult:
                 # Per-line streaming arrays: stored as REAL*4 / int32 to match
                 # Fortran SYNTHE line-data precision and to halve the bytes the
                 # depth-parallel molecular kernel re-streams (bandwidth bound).
-                mol_element_idx = np.array(
-                    [int(n) // 6 - 1 for n in mol_nelion_raw], dtype=np.int32
-                )
+                # Vectorized NELION->element index (was a 47.8M-element Python
+                # list comp ~3.7s/run). Floor-div matches int(n)//6 for the
+                # non-negative molecular species codes.
+                mol_element_idx = (
+                    mol_nelion_raw.astype(np.int64) // 6 - 1
+                ).astype(np.int32)
                 mol_cgf = np.asarray(combined_mol["cgf"], dtype=np.float32)
                 mol_gamma_rad = np.asarray(combined_mol["gamma_rad"], dtype=np.float32)
                 mol_gamma_stark = np.asarray(combined_mol["gamma_stark"], dtype=np.float32)
