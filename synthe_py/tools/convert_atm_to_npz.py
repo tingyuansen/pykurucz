@@ -2058,9 +2058,6 @@ if __name__ == "__main__":
             xnfpfe=xnfpfe,  # Fe I for FE1OP (35% of opacity at 300nm!)
         )
 
-        print("Computing continuum from .atm using atlas_tables...")
-        t0 = time.time()
-
         # FIXED: Use IFOP from .atm file to match Fortran xnfpelsyn behavior
         # Evidence from Fortran source code:
         #   - xnfpelsyn.for line 154: CALL READIN(20) reads .atm file including IFOP
@@ -2070,13 +2067,15 @@ if __name__ == "__main__":
         # For cool stars (T < 4000K), IFOP(13)=1 enables H2RAOP which is critical
         # since most hydrogen is molecular (H2). Missing this causes ~400x error.
         ifop_from_atm = atm_data.get("ifop", None)  # Use IFOP from .atm file
-        cont_abs_log, cont_scat_log = compute_continuum_from_atm(
-            atmosphere, freqset, ifop=ifop_from_atm
-        )
-        t_continuum = time.time() - t0
-
-        print(f"  Computed continuum for {n_layers} layers, {len(freqset)} frequencies")
-        print(f"  [TIMING] Continuum computation: {t_continuum:.3f}s")
+        # PERF: the continuum is recomputed below with the full population_per_ion
+        # (KAPP hot/lukewarm branches need it). When POPS runs (the normal path)
+        # the result of an early pass here is *discarded* by that recompute -- the
+        # intermediate cont_abs_log/cont_scat_log are never read in between -- so
+        # computing it here is pure wasted work (~3-5 s/star). Defer it; the
+        # recompute block below computes it once with full populations, and only
+        # falls back to a population-free pass if POPS produced no populations.
+        cont_abs_log = None
+        cont_scat_log = None
 
     else:
         raise RuntimeError(
@@ -2451,17 +2450,32 @@ if __name__ == "__main__":
         xnf_he1 = population[:, 0, 1]  # Element 2 (He), ion 1
         xnf_he2 = population[:, 1, 1]  # Element 2 (He), ion 2
 
-    # Recompute continuum after full POPS so KAPP hot/lukewarm branches
-    # can use population_per_ion when IFOP enables them.
+    # Compute continuum after full POPS so KAPP hot/lukewarm branches
+    # can use population_per_ion when IFOP enables them. This is the single
+    # continuum pass on the normal path (the earlier pass was deferred above).
     if use_atlas_tables and population is not None:
         atmosphere.population_per_ion = population
-        print("Recomputing continuum with full population_per_ion for KAPP...")
+        print("Computing continuum with full population_per_ion for KAPP...")
         t0 = time.time()
         cont_abs_log, cont_scat_log = compute_continuum_from_atm(
             atmosphere, freqset, ifop=atm_data.get("ifop", None)
         )
-        t_continuum_recompute = time.time() - t0
-        print(f"  [TIMING] Continuum recompute: {t_continuum_recompute:.3f}s")
+        t_continuum = time.time() - t0
+        print(
+            f"  Computed continuum for {n_layers} layers, {len(freqset)} frequencies"
+        )
+        print(f"  [TIMING] Continuum computation: {t_continuum:.3f}s")
+
+    # Fallback: if POPS produced no population_per_ion, compute the continuum
+    # without it (matches the pre-optimization behavior for that edge case).
+    if use_atlas_tables and cont_abs_log is None:
+        print("Computing continuum (no population_per_ion available)...")
+        t0 = time.time()
+        cont_abs_log, cont_scat_log = compute_continuum_from_atm(
+            atmosphere, freqset, ifop=atm_data.get("ifop", None)
+        )
+        t_continuum = time.time() - t0
+        print(f"  [TIMING] Continuum computation: {t_continuum:.3f}s")
 
     # Compute interpolation coefficients AFTER H2 equilibrium correction
     print("Computing interpolation coefficients...")

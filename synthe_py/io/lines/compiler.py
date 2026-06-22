@@ -157,36 +157,90 @@ def _catalog_from_cached_arrays(data: np.lib.npyio.NpzFile) -> atomic.LineCatalo
     gamma_vdw_log = np.asarray(data["catalog_gamma_vdw_log"], dtype=np.float64)
 
     n = int(wavelength.size)
-    records: list[atomic.LineRecord] = []
-    for i in range(n):
-        records.append(
-            atomic.LineRecord(
-                wavelength=float(wavelength[i]),
-                index_wavelength=float(index_wavelength[i]),
-                element=str(element[i]),
-                ion_stage=int(ion_stage[i]),
-                log_gf=float(log_gf[i]),
-                excitation_energy=float(excitation_energy[i]),
-                gamma_rad=float(gamma_rad[i]),
-                gamma_stark=float(gamma_stark[i]),
-                gamma_vdw=float(gamma_vdw[i]),
-                metadata={},
-                line_type=int(line_type[i]),
-                n_lower=int(n_lower[i]),
-                n_upper=int(n_upper[i]),
-                code=float(code[i]),
-                iso1=int(iso1[i]),
-                iso2=int(iso2[i]),
-                line_size=int(line_size[i]),
-                labelp=str(labelp[i]),
-                xj=float(xj[i]),
-                xjp=float(xjp[i]),
-                gamma_rad_log=float(gamma_rad_log[i]),
-                gamma_stark_log=float(gamma_stark_log[i]),
-                gamma_vdw_log=float(gamma_vdw_log[i]),
-            )
+
+    # PERF: index the columns as native Python lists rather than doing 24 numpy
+    # scalar extractions (float(arr[i])/int(arr[i])) per record. .tolist() is a
+    # single vectorized C call per column and returns native float/int/str, so
+    # the per-record loop touches only Python objects. Bit-identical values.
+    wl_l = wavelength.tolist()
+    iw_l = index_wavelength.tolist()
+    el_l = element.tolist()
+    ion_l = ion_stage.tolist()
+    lgf_l = log_gf.tolist()
+    exc_l = excitation_energy.tolist()
+    grad_l = gamma_rad.tolist()
+    gstk_l = gamma_stark.tolist()
+    gvdw_l = gamma_vdw.tolist()
+    lt_l = line_type.tolist()
+    nlo_l = n_lower.tolist()
+    nup_l = n_upper.tolist()
+    code_l = code.tolist()
+    iso1_l = iso1.tolist()
+    iso2_l = iso2.tolist()
+    lsz_l = line_size.tolist()
+    lab_l = labelp.tolist()
+    xj_l = xj.tolist()
+    xjp_l = xjp.tolist()
+    gradlog_l = gamma_rad_log.tolist()
+    gstklog_l = gamma_stark_log.tolist()
+    gvdwlog_l = gamma_vdw_log.tolist()
+
+    LineRecord = atomic.LineRecord
+    records: list[atomic.LineRecord] = [
+        LineRecord(
+            wavelength=wl_l[i],
+            index_wavelength=iw_l[i],
+            element=el_l[i],
+            ion_stage=ion_l[i],
+            log_gf=lgf_l[i],
+            excitation_energy=exc_l[i],
+            gamma_rad=grad_l[i],
+            gamma_stark=gstk_l[i],
+            gamma_vdw=gvdw_l[i],
+            metadata={},
+            line_type=lt_l[i],
+            n_lower=nlo_l[i],
+            n_upper=nup_l[i],
+            code=code_l[i],
+            iso1=iso1_l[i],
+            iso2=iso2_l[i],
+            line_size=lsz_l[i],
+            labelp=lab_l[i],
+            xj=xj_l[i],
+            xjp=xjp_l[i],
+            gamma_rad_log=gradlog_l[i],
+            gamma_stark_log=gstklog_l[i],
+            gamma_vdw_log=gvdwlog_l[i],
         )
-    return atomic.LineCatalog.from_records(records)
+        for i in range(n)
+    ]
+
+    # PERF: the array fields are already present in the cache. Build the
+    # LineCatalog directly instead of re-deriving every array from the freshly
+    # built record list (LineCatalog.from_records would loop over all records
+    # ~13 more times). The derivations below reproduce from_records exactly:
+    #   - gf = 10**log_gf
+    #   - index_wavelength resolves rec.index_wavelength>0 else wavelength
+    #   - dtypes: elements=object, ion_stages=int16, line_types=int8, n_*=int16
+    resolved_index_wavelength = np.where(
+        index_wavelength > 0.0, index_wavelength, wavelength
+    )
+    return atomic.LineCatalog(
+        records=records,
+        wavelength=wavelength,
+        index_wavelength=resolved_index_wavelength,
+        log_gf=log_gf,
+        gf=np.power(10.0, log_gf),
+        excitation_energy=excitation_energy,
+        gamma_rad=gamma_rad,
+        gamma_stark=gamma_stark,
+        gamma_vdw=gamma_vdw,
+        elements=np.asarray(el_l, dtype=object),
+        ion_stages=ion_stage.astype(np.int16, copy=False),
+        line_types=line_type.astype(np.int8, copy=False),
+        n_lower=n_lower.astype(np.int16, copy=False),
+        n_upper=n_upper.astype(np.int16, copy=False),
+    )
 
 
 def _compiled_from_cache(cache_path: Path) -> Optional[CompiledLineCatalog]:
