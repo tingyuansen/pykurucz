@@ -23,6 +23,15 @@ from ._pfground_table import (
     PFGROUND_EXPRESSIONS,
 )
 
+# Optional Numba-JIT PFSAHA kernel (bit-identical to _pfsaha_exact_python).
+# Falls back to the pure-Python reference when numba is unavailable.
+try:
+    from . import pfsaha_numba as _PFSAHA_NUMBA_MOD
+
+    _PFSAHA_NUMBA = _PFSAHA_NUMBA_MOD if _PFSAHA_NUMBA_MOD._NUMBA_AVAILABLE else None
+except Exception:  # pragma: no cover - defensive fallback
+    _PFSAHA_NUMBA = None
+
 
 
 def _compute_xnfpmol(
@@ -961,9 +970,44 @@ def pfsaha_exact(
     """Exact implementation of PFSAHA subroutine from atlas7v.for.
 
     This is a direct port of the Fortran code with all special cases.
+
+    Dispatches to a Numba-JIT kernel (``pfsaha_numba._pfsaha_core_nb``) when
+    numba and all required tables are available; the result is bit-identical to
+    the pure-Python reference ``_pfsaha_exact_python`` (verified across the full
+    IZ/ion/mode/departure grid). Falls back to the pure-Python path otherwise.
     """
     if POTION is None:
         raise RuntimeError("POTION data not loaded. Call load_fortran_data() first.")
+
+    if (
+        _PFSAHA_NUMBA is not None
+        and NNN is not None
+        and PFTAB is not None
+        and POTLO_PFIRON is not None
+        and POTLOLOG_PFIRON is not None
+    ):
+        _PFSAHA_NUMBA.pfsaha_core_numba(
+            iz,
+            nion,
+            mode,
+            temperature,
+            tkev,
+            tk,
+            hkt,
+            hckt,
+            tlog,
+            gas_pressure,
+            electron_density,
+            answer,
+            POTION,
+            NNN,
+            PFTAB,
+            POTLO_PFIRON,
+            POTLOLOG_PFIRON,
+            departure_tables,
+            nlte_on,
+        )
+        return
 
     _pfsaha_exact_python(
         iz,
