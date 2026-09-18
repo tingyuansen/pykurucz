@@ -138,6 +138,6 @@ nav:
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/pykurucz/pykurucz
+      link: https://github.com/tingyuansen/pykurucz
   version:
     provider: mike

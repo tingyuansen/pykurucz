@@ -30,7 +30,7 @@ The following packages are required for **all** modes of operation:
 Clone the repository and install the Python dependencies:
 
 ```bash
-git clone https://github.com/pykurucz/pykurucz.git
+git clone https://github.com/tingyuansen/pykurucz.git
 cd pykurucz
 pip install -r requirements.txt
 ```
